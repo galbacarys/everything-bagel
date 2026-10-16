@@ -23,8 +23,10 @@ import { toolPolicyFor } from "../supervisor/policy.ts";
 import type { ProjectPaths } from "../util/paths.ts";
 import {
   commitStaged,
+  existingPullRequestUrl,
   openPullRequest,
   PR_BODY_FILE,
+  pullRequestBase,
   pushBranch,
   stageAll,
   stagedDiff,
@@ -468,7 +470,7 @@ export class Roster {
   async land(
     runId: string,
     options: { title: string; body: string },
-  ): Promise<{ url: string; branch: string; base: string; committed: boolean; sha?: string }> {
+  ): Promise<{ url: string; branch: string; base: string; committed: boolean; sha?: string; reused?: boolean }> {
     const meta = await this.metaFor(runId);
 
     const worktree = meta.worktree;
@@ -491,15 +493,21 @@ export class Roster {
     );
     await pushBranch(worktree, branch);
 
-    const pr = await openPullRequest({
-      cwd: worktree,
-      title: options.title,
-      body: options.body,
-      // Into the run directory, not the worktree, which is about to be pushed.
-      bodyPath: join(this.#records.get(runId)?.dir ?? join(this.#paths.runs, runId), PR_BODY_FILE),
-      base,
-      head: branch,
-    });
+    // Idempotent, because an earlier attempt can push the branch and then fail to open the
+    // pull request. Landing again should finish the job rather than open a second one.
+    const existing = await existingPullRequestUrl(worktree, branch);
+    const runPath = this.#records.get(runId)?.dir ?? join(this.#paths.runs, runId);
+    const pr = existing
+      ? { url: existing, bodyPath: join(runPath, PR_BODY_FILE) }
+      : await openPullRequest({
+          cwd: worktree,
+          title: options.title,
+          body: options.body,
+          // Into the run directory, not the worktree, which is about to be pushed.
+          bodyPath: join(runPath, PR_BODY_FILE),
+          base: pullRequestBase(base),
+          head: branch,
+        });
 
     // Record the pull request wherever this run's metadata lives. A run dispatched by an
     // earlier process has no in-memory record, and losing the URL would be a shame.
@@ -507,7 +515,7 @@ export class Roster {
     if (record) {
       record.meta = { ...record.meta, prUrl: pr.url };
       await writeMeta(record.dir, record.meta);
-      await record.log.note(`pull request opened: ${pr.url}`);
+      await record.log.note(`pull request: ${pr.url}`);
     } else {
       await writeMeta(join(this.#paths.runs, runId), { ...meta, prUrl: pr.url });
     }
@@ -517,6 +525,7 @@ export class Roster {
       branch,
       base,
       committed: commit.committed,
+      ...(existing ? { reused: true } : {}),
       ...(commit.sha ? { sha: commit.sha } : {}),
     };
   }

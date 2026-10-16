@@ -12,6 +12,11 @@
  * It creates a real branch and opens a real pull request. That is the point — the last
  * stage of the loop cannot be verified without one. It prints the URL so the pull request
  * can be reviewed or closed.
+ *
+ * It exercises one specific change, named by `SLUG`, `PLAN`, and `TARGET_FILE` below.
+ * Point those at a different artifact to verify a different path; do not re-run it against
+ * a file that already exists on the base branch, since the plan tells the worker to create
+ * it.
  */
 
 import { existsSync } from "node:fs";
@@ -30,38 +35,45 @@ import { MemoryTracker } from "../src/tracker/adapter.ts";
 import { Backlog } from "../src/tracker/backlog.ts";
 import { ensureProjectDirs } from "../src/util/paths.ts";
 
-const SLUG = "document-the-loop";
+const SLUG = "document-verbs";
 /** A second, deliberately never-approved plan, so the refusal check stays honest on
  *  re-runs. Reusing the real slug would pass only once, since it is approved by then. */
 const UNAPPROVED_SLUG = "refusal-probe";
-const TASK_ID = "3";
+const TASK_ID = process.env["LOOP_TASK_ID"] ?? "3";
+/** The one file the plan permits the worker to create. */
+const TARGET_FILE = "docs/verbs.md";
 const STEP_TIMEOUT_MS = 420_000;
 
 const PLAN = `## Contract
 
-Add a file \`docs/loop.md\` describing bagel's end-to-end path, in roughly 40 lines.
+Add \`docs/verbs.md\`, a reference for the supervisor's action space: the typed verbs it
+has, what each is for, and what it deliberately cannot do.
 
 ## What it must contain
 
-One \`#\` heading, a two-sentence introduction, then one \`##\` section per stage, in this
-order:
+One \`#\` heading, a two-sentence introduction, then one \`##\` section per verb group, in
+this order:
 
-1. task — the supervisor proposes, a human picks, the task is claimed
-2. plan — written to disk and approved by a human; the approval is what grants permission
-3. dispatch — a worker in its own git worktree, branched from the default branch
-4. review — an independent reviewer reads the plan and the staged diff
-5. land — commit, push, open a pull request for a human to read
+1. backlog — reading, filing, and moving tasks, and claiming one for a run
+2. notebook — recording decisions, and searching past ones before re-deriving anything
+3. plan — writing a plan, and what approval actually records
+4. gate — asking a human to decide, and the only two things worth asking about
+5. dispatch — starting a worker, steering it, reviewing it, and landing the result
+
+Then a closing \`## Not available\` section naming what the supervisor has no verb for:
+running shell commands, editing files, pushing directly, and merging.
 
 ## Constraints
 
-- Plain Markdown. No invented flags, no invented paths.
-- Mention only \`bagel\`, \`bun run\`, and the stage names above.
-- Do not create or modify any file other than \`docs/loop.md\`.
+- Plain Markdown.
+- Base every verb name on \`src/extension/bagel.ts\`, which is the source of truth. Read it
+  before writing, and do not invent a verb.
+- Do not create or modify any file other than \`docs/verbs.md\`.
 
 ## Acceptance
 
-- \`docs/loop.md\` exists.
-- All five stages appear, in order.
+- \`docs/verbs.md\` exists and names only real verbs.
+- All five groups and the closing section appear, in the order above.
 - No other file is changed.`;
 
 // ---------------------------------------------------------------------------
@@ -218,7 +230,7 @@ check(
   "the worktree is outside the repository",
   !(implRecord?.meta.worktree ?? "").startsWith(`${config.repoRoot}/`),
 );
-check("the main checkout is untouched", !existsSync(join(config.repoRoot, "docs/loop.md")));
+check("the main checkout is untouched", !existsSync(join(config.repoRoot, TARGET_FILE)));
 
 // ---------------------------------------------------------------------------
 // 4. Review
@@ -247,9 +259,9 @@ if (verdict !== "PASS") {
 } else {
   const landed = (await call("dispatch.land", {
     runId: implementer.runId,
-    title: `Document the end-to-end loop (closes #${TASK_ID})`,
+    title: `Document the supervisor\u2019s action space (closes #${TASK_ID})`,
     body: [
-      "Adds `docs/loop.md`, describing the path from a chosen task to an opened pull request.",
+      `Adds \`${TARGET_FILE}\`, a reference for the supervisor\u2019s typed verbs and what they exclude.`,
       "",
       `Closes #${TASK_ID}`,
       "",

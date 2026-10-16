@@ -185,6 +185,17 @@ export async function aheadOfBase(worktree: string, base: string): Promise<numbe
   return Number.parseInt(count, 10) || 0;
 }
 
+/**
+ * The branch name a pull request targets.
+ *
+ * `--base` wants a branch on the remote, not a local ref. `origin/main` is the right thing
+ * to *branch* from and the wrong thing to *open against*: gh rejects it with "Base ref must
+ * be a branch", alongside two misleading complaints about blank SHAs.
+ */
+export function pullRequestBase(base: string, remote = "origin"): string {
+  return base.startsWith(`${remote}/`) ? base.slice(remote.length + 1) : base;
+}
+
 /** The repository's pull-request URL for a branch, whether or not one exists yet. */
 export async function existingPullRequestUrl(worktree: string, branch: string): Promise<string | undefined> {
   try {
