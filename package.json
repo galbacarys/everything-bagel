@@ -17,7 +17,8 @@
     "preview": "bun run scripts/render-preview.ts",
     "backlog": "bun run scripts/backlog.ts",
     "dispatch": "bun run scripts/dispatch.ts",
-    "build": "bun build --compile --outfile dist/bagel src/main.ts"
+    "build": "bun build --compile --outfile dist/bagel src/main.ts",
+    "stats": "bun run scripts/stats.ts"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.3.0",
