@@ -20,6 +20,10 @@ const args = process.argv.slice(2);
 const asJson = args.includes("--json");
 const claimsOnly = args.includes("--claims");
 const seed = args.includes("--seed");
+/** Claim or release a task for this process's session, for scripting around the UI. */
+const claimArg = args.find((a) => a.startsWith("--claim="))?.slice("--claim=".length);
+const releaseArg = args.find((a) => a.startsWith("--release="))?.slice("--release=".length);
+const asSession = args.find((a) => a.startsWith("--session="))?.slice("--session=".length) ?? "cli";
 /** Inspect any repository, not just this one. Read-only: seeding is refused. */
 const slugArg = args.find((a) => a.startsWith("--slug="))?.slice("--slug=".length);
 
@@ -43,6 +47,21 @@ if (slugArg) {
     process.exit(1);
   }
   tracker = probe.tracker;
+}
+
+if (claimArg) {
+  const outcome = await tracker.claim(claimArg, asSession, { ttlMs: 4 * 60 * 60 * 1000 });
+  console.log(
+    outcome.ok
+      ? `CLAIMED #${claimArg} as ${asSession}`
+      : `LOST   #${claimArg} held by ${outcome.holder?.holder ?? outcome.holder?.session ?? "someone else"}`,
+  );
+  process.exit(outcome.ok ? 0 : 1);
+}
+
+if (releaseArg) {
+  await tracker.release(releaseArg, asSession);
+  console.log(`RELEASED #${releaseArg}`);
 }
 
 if (seed) {

@@ -12,7 +12,7 @@
 
 import { Input, Key, Markdown, matchesKey, truncateToWidth, type Component } from "@earendil-works/pi-tui";
 import type { Bus, DomainEvent } from "../domain/events.ts";
-import type { AgentRun } from "../domain/types.ts";
+import type { AgentRun, GateRequest } from "../domain/types.ts";
 import { columns, frame } from "./layout.ts";
 import {
   agentsContent,
@@ -52,11 +52,15 @@ export class App implements Component {
   #supervisorText = "";
   #supervisorRunId: string | undefined;
   #notice: { level: "info" | "warn" | "error"; message: string } | undefined;
+  /** Gates awaiting an answer, oldest first. The input line is replaced while one is open. */
+  #gates: GateRequest[] = [];
   #focused = false;
   #unsubscribe: () => void;
 
   onSubmit?: (text: string) => void;
   onQuit?: () => void;
+  /** Called when a human answers a gate. bagel owns the pending gate, not the UI. */
+  onGateAnswer?: (id: string, accepted: boolean) => void;
 
   constructor(options: AppOptions) {
     this.#height = options.height;
@@ -179,12 +183,15 @@ export class App implements Component {
       }
 
       case "gate.requested": {
-        this.#notice = { level: "warn", message: `approval needed: ${event.request.prompt}` };
+        if (!this.#gates.some((gate) => gate.id === event.request.id)) {
+          this.#gates = [...this.#gates, event.request];
+        }
+        this.#notice = undefined;
         break;
       }
 
       case "gate.resolved": {
-        this.#notice = undefined;
+        this.#gates = this.#gates.filter((gate) => gate.id !== event.id);
         break;
       }
 
@@ -211,6 +218,22 @@ export class App implements Component {
     if (matchesKey(data, Key.ctrl("c"))) {
       this.onQuit?.();
       return;
+    }
+
+    // A gate outranks everything except quitting: it is a blocking question, and the
+    // run that asked is parked until it is answered. Tab still works, so panes stay
+    // reachable while deciding.
+    const gate = this.#gates[0];
+    if (gate) {
+      if (data === "y" || matchesKey(data, Key.enter)) {
+        this.onGateAnswer?.(gate.id, true);
+        return;
+      }
+      if (data === "n" || matchesKey(data, Key.escape)) {
+        this.onGateAnswer?.(gate.id, false);
+        return;
+      }
+      if (!matchesKey(data, Key.tab) && !matchesKey(data, Key.shift("tab"))) return;
     }
 
     if (matchesKey(data, Key.tab)) {
@@ -320,9 +343,30 @@ export class App implements Component {
     const lines: string[] = [headerLine(this.#state, screenWidth, this.#repoId, this.#session)];
     if (notice) lines.push(notice);
     lines.push(...top, ...bottom);
-    lines.push(this.#input.render(screenWidth)[0] ?? "");
+    lines.push(this.#footerLine(screenWidth));
 
     return lines.slice(0, screenHeight);
+  }
+
+  /** The bottom line is the input, unless a gate has taken it over. */
+  #footerLine(width: number): string {
+    const gate = this.#gates[0];
+    if (!gate) return this.#input.render(width)[0] ?? "";
+
+    const more = this.#gates.length > 1 ? dim(`  (+${this.#gates.length - 1} more)`) : "";
+    const line = [
+      palette.warn("▌ "),
+      palette.warn("DECIDE"),
+      " ",
+      truncateToWidth(gate.prompt, Math.max(10, width - 46), "…", false),
+      dim("   "),
+      palette.ok("[y]"),
+      ` ${gate.accept}`,
+      dim("   "),
+      palette.err("[n]"),
+      " decline",
+    ].join("");
+    return truncateToWidth(line + more, width, "…", true);
   }
 
   #frameFor(pane: PaneId): FrameStyle {

@@ -33,6 +33,14 @@ export interface AgentOptions {
   sessionDir?: string;
   /** Pass `--approve` so project-local extensions and skills can load. */
   trustProjectFiles?: boolean;
+  /** Absolute path to a pi extension. Loaded with extension discovery disabled. */
+  extension?: string;
+  /** Disable built-in tools, so only extension tools and the allowlist remain. */
+  noBuiltinTools?: boolean;
+  /** Comma-separated allowlist of tool names or patterns to activate. */
+  toolAllowlist?: string;
+  /** Reasoning effort. */
+  thinking?: string;
   /** Appended to the system prompt. */
   appendSystemPrompt?: string;
   extraArgs?: string[];
@@ -61,6 +69,16 @@ export class Agent {
     if (options.sessionDir) args.push("--session-dir", options.sessionDir);
     if (options.trustProjectFiles) args.push("--approve");
     if (options.appendSystemPrompt) args.push("--append-system-prompt", options.appendSystemPrompt);
+    if (options.thinking) args.push("--thinking", options.thinking);
+
+    // `--no-extensions` turns off discovery and the built-in extensions, but an explicit
+    // `-e` path still loads. That combination is what makes the child's action space
+    // exactly the bagel verbs rather than whatever happens to be installed.
+    if (options.extension) args.push("--no-extensions", "--extension", options.extension);
+    // Order matters: this clears the built-ins, then the allowlist re-admits named ones.
+    if (options.noBuiltinTools) args.push("--no-builtin-tools");
+    if (options.toolAllowlist) args.push("--tools", options.toolAllowlist);
+
     if (options.extraArgs?.length) args.push(...options.extraArgs);
 
     this.run = {

@@ -9,7 +9,7 @@
  *   bun run scripts/smoke.ts [prompt]
  */
 
-import { resolveConfig } from "../src/config.ts";
+import { resolveConfig, tierFor } from "../src/config.ts";
 import { Bus } from "../src/domain/events.ts";
 import { Agent } from "../src/pi/agent.ts";
 import { ensureProjectDirs } from "../src/util/paths.ts";
@@ -64,6 +64,8 @@ bus.on((event) => {
   }
 });
 
+const model = config.models[tierFor("supervisor")];
+
 const agent = new Agent({
   role: "supervisor",
   cwd: config.repoRoot,
@@ -72,8 +74,9 @@ const agent = new Agent({
   trustProjectFiles: config.trustProjectFiles,
   appendSystemPrompt: "You are being smoke-tested. Answer in one short line.",
   ...(config.piCli ? { cliPath: config.piCli } : {}),
-  ...(config.supervisor.provider ? { provider: config.supervisor.provider } : {}),
-  ...(config.supervisor.model ? { model: config.supervisor.model } : {}),
+  ...(model.provider ? { provider: model.provider } : {}),
+  ...(model.model ? { model: model.model } : {}),
+  ...(model.thinking ? { thinking: model.thinking } : {}),
 });
 
 const finished = new Promise<void>((resolve) => {

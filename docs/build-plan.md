@@ -31,19 +31,64 @@ its pane with the title switching to `supervisor ●` while it works.
 step 2; until then it can read and run bash like any agent, which is exactly what this
 step is meant to make unnecessary.
 
-## 2. Give the supervisor verbs
+## 2. Give the supervisor verbs — *done*
 
-**Risk retired:** that typed tools can replace a shell for the supervisor.
+**Risk retired:** that typed tools can replace a shell for the supervisor. They can, and
+the supervisor now has no shell at all.
 
-- [ ] pi extension (`src/extension/bagel.ts`) registering `backlog.*`, `plan.write`,
-      `notebook.*`, `dispatch.*`, `gate.request`
-- [ ] Unix-socket bridge (`src/ipc/bridge.ts`) so the extension forwards calls to the
-      bagel process, which stays authoritative
-- [ ] Extension UI subprotocol wired to the gate dialog, so pi can ask and bagel draws
-- [ ] Supervisor receives the bagel extension via `-e`, and nothing else
+- [x] `src/extension/bagel.ts` — a pi extension registering `backlog_*`, `notebook_*`,
+      `plan_write`, `gate_request`, scoped by role. Deliberately self-contained: it
+      imports only `typebox` and `node:net`, because pi loads it through jiti from a
+      worktree and every cross-file import is one more thing that can fail to resolve.
+- [x] `src/ipc/bridge.ts` — a unix-socket bridge, **one connection per request**. That
+      costs a syscall and removes reconnection logic, partial-write framing, and stale
+      socket state after a bagel restart.
+- [x] `src/supervisor/verbs.ts` — the verbs, and therefore the authority. Arguments
+      arrive as untrusted JSON from another process, so every one is validated; on
+      errors, an unknown verb is reported rather than ignored.
+- [x] `src/supervisor/gates.ts` — gates always settle. A forgotten prompt, an aborted
+      run, or a disconnected bridge all resolve as declined, so a supervisor cannot hang
+      forever on an answer that is not coming.
+- [x] `src/supervisor/policy.ts` — the enforcement point. See below.
+- [x] Supervisor runs with `--no-extensions -e <extension>` and `--no-builtin-tools`.
 
-**Done when:** the supervisor can list the backlog and append a journal entry through
-tools rather than by guessing, and an approval prompt appears as a bagel dialog.
+### What enforces the action space
+
+The claim "the action space *is* the lifecycle" is now literal, and it rests on three
+empirically established facts rather than on a prompt:
+
+- `--no-extensions` disables discovery and the built-in extensions, but an explicit
+  `-e <path>` still loads. The child's extensions are therefore exactly ours.
+- `--no-builtin-tools` removes `bash`, `edit`, `write`, and `read`.
+- `--tools` re-admits named tools — and it is also an allowlist over *extension* tools,
+  so the extension's own verb names must be listed or they are registered but inactive.
+
+Final policy: `--no-builtin-tools --tools "read,backlog_*,notebook_*,plan_write,gate_request"`.
+The supervisor keeps `read` and nothing else built-in, because planning needs to see the
+code and reading is neither mutating nor executing. Denying it would produce worse plans
+without making anything safer.
+
+### Why the gate does not use pi's dialogs
+
+The design originally routed approvals through pi's extension-UI subprotocol so that
+`ctx.ui.confirm()` would be drawn by bagel. That is not reachable from our client:
+`RpcClient` dispatches `extension_ui_request` to event listeners, but its `send` is
+private, so there is no way to answer one. A gate built on it would hang.
+
+Routing the gate through the bridge instead is simpler and better: it is one channel
+rather than two, the dialog is drawn by the component that owns the screen anyway, and
+the pending gate stays in the process that knows whether the asking run is still alive.
+
+**Verified:** `bun test` covers the bridge round trip, unknown verbs, malformed JSON,
+handler exceptions, socket-path shortening, handler cancellation when the caller
+disappears, and eight gate cases (timeout, abort, double-settle, queue ordering,
+shutdown cancellation). 39 tests, 100 assertions. Live: a supervisor session drove
+`backlog_get` ×5, `notebook_search` ×3, `read` ×3, `notebook_append`, and `gate_request`,
+with **no `bash` at all** — and it noticed from the tracker that #1 was already claimed,
+so it recommended #2 instead. That is the claim protocol working across two actors.
+
+**Not in this step:** `dispatch_*`. It needs worktrees and worker lifecycle, which is #2.
+The prompt says so explicitly rather than letting the model offer verbs it lacks.
 
 ## 3. Real backlog — *done*
 

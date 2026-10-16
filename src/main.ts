@@ -2,21 +2,26 @@
 /**
  * bagel — a control room for agentic software work.
  *
- * This process owns the screen. Every agent is a `pi --mode rpc` child whose events
- * are translated into domain events (src/pi/agent.ts), which flow through a bus to
- * the UI and, later, to the notebook.
+ * This process owns the screen and owns the state. Every agent is a `pi --mode rpc`
+ * child whose events become domain events; the supervisor additionally reaches back
+ * through a local socket to act on the backlog, the notebook, and gates, because its
+ * own tool surface is deliberately limited to those verbs.
  *
- * The coordination plane is the repository's issue tracker. When it is reachable we
- * use it; when it is not, we say so and fall back to an in-memory backlog so the
- * control room still works.
+ * See docs/design.md for why the seams are where they are.
  */
 
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { Container, ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
-import { resolveConfig } from "./config.ts";
+import { resolveConfig, tierFor } from "./config.ts";
 import { Bus } from "./domain/events.ts";
+import { BridgeServer } from "./ipc/bridge.ts";
 import { Notebook } from "./notebook/store.ts";
 import { Agent } from "./pi/agent.ts";
+import { GateQueue } from "./supervisor/gates.ts";
+import { toolPolicyFor } from "./supervisor/policy.ts";
 import { supervisorPrompt } from "./supervisor/prompt.ts";
+import { buildHandlers } from "./supervisor/verbs.ts";
 import { MemoryTracker, type TrackerAdapter } from "./tracker/adapter.ts";
 import { Backlog } from "./tracker/backlog.ts";
 import { probeGitHub } from "./tracker/github.ts";
@@ -25,6 +30,23 @@ import { ensureProjectDirs, originUrl } from "./util/paths.ts";
 
 const REFRESH_MS = 30_000;
 const BACKLOG_LIMIT = 60;
+
+/**
+ * Where the bagel extension lives.
+ *
+ * `--extension` needs a real file for pi's jiti loader, so a compiled binary has to ship
+ * this alongside itself. `BAGEL_EXTENSION` is the escape hatch for that case.
+ */
+function resolveExtensionPath(): string | undefined {
+  const explicit = process.env["BAGEL_EXTENSION"]?.trim();
+  if (explicit) return explicit;
+  try {
+    // Relative to this file, so `./` is `src/main.ts` -> `src/extension/bagel.ts`.
+    return fileURLToPath(new URL("./extension/bagel.ts", import.meta.url));
+  } catch {
+    return undefined;
+  }
+}
 
 async function main(): Promise<void> {
   const config = resolveConfig();
@@ -37,6 +59,7 @@ async function main(): Promise<void> {
 
   const bus = new Bus();
   const notebook = new Notebook(config.paths.journal, config.paths.docs);
+  const gates = new GateQueue({ bus });
 
   const terminal = new ProcessTerminal();
   const tui = new TuiMainScreen(terminal);
@@ -59,15 +82,24 @@ async function main(): Promise<void> {
   let shuttingDown = false;
   let supervisor: Agent | undefined;
   let backlog: Backlog | undefined;
+  let bridge: BridgeServer | undefined;
 
   const shutdown = async (code = 0): Promise<void> => {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Decline anything outstanding so a parked tool call does not outlive the UI that
+    // was going to answer it.
+    gates.cancelAll("bagel is shutting down");
     backlog?.stop();
+    try {
+      await bridge?.close();
+    } catch {
+      // Nothing to do on the way out.
+    }
     try {
       await supervisor?.stop();
     } catch {
-      // Best effort on the way out.
+      // Best effort.
     }
     try {
       tui.stop();
@@ -80,6 +112,15 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => void shutdown(0));
   process.on("SIGTERM", () => void shutdown(0));
   app.onQuit = () => void shutdown(0);
+  app.onGateAnswer = (id, accepted) => {
+    if (!gates.resolve(id, { accepted })) return;
+    void notebook.append({
+      actor: "human",
+      kind: "decision",
+      body: accepted ? "Approved a gate." : "Declined a gate.",
+      tags: ["gate"],
+    });
+  };
 
   // -- input ----------------------------------------------------------------
 
@@ -91,8 +132,8 @@ async function main(): Promise<void> {
     const entry = await notebook.append({ actor: "human", kind: "session", body: text });
     bus.emit({ type: "notebook.appended", entry });
     try {
-      // Steering while busy is the whole reason the supervisor runs over RPC rather
-      // than as a one-shot process.
+      // Steering while busy is why the supervisor runs over RPC rather than as a
+      // one-shot process.
       if (supervisor.busy) await supervisor.steer(text);
       else await supervisor.prompt(text);
     } catch (error) {
@@ -106,9 +147,7 @@ async function main(): Promise<void> {
 
   bus.emit({ type: "notice", level: "info", message: `state ${config.paths.root}` });
 
-  const remote = originUrl(config.repoRoot);
-  const probe = await probeGitHub(remote, { cwd: config.repoRoot });
-
+  const probe = await probeGitHub(originUrl(config.repoRoot), { cwd: config.repoRoot });
   let adapter: TrackerAdapter;
   let degradedReason: string | undefined;
   if (probe.ok) {
@@ -136,7 +175,37 @@ async function main(): Promise<void> {
     bus.emit({ type: "notebook.appended", entry });
   }
 
+  // -- bridge ---------------------------------------------------------------
+
+  const extensionPath = resolveExtensionPath();
+  const policy = extensionPath ? toolPolicyFor("supervisor", extensionPath) : undefined;
+
+  bridge = new BridgeServer({
+    path: join(config.paths.root, "bridge.sock"),
+    handlers: buildHandlers({
+      backlog,
+      notebook,
+      gates,
+      plansPath: config.paths.plans,
+      session: config.session,
+      role: "supervisor",
+    }),
+    onError: (error, verb) => {
+      bus.emit({ type: "notice", level: "error", message: `${verb ?? "bridge"}: ${describe(error)}` });
+    },
+  });
+
+  try {
+    await bridge.listen();
+  } catch (error) {
+    bus.emit({ type: "notice", level: "error", message: `bridge failed to listen: ${describe(error)}` });
+    return;
+  }
+
   // -- supervisor -----------------------------------------------------------
+
+  const tier = tierFor("supervisor");
+  const model = config.models[tier];
 
   const appendSystemPrompt = supervisorPrompt({
     repoRoot: config.repoRoot,
@@ -144,7 +213,8 @@ async function main(): Promise<void> {
     trackerName: adapter.name,
     notebookPath: config.paths.notebook,
     plansPath: config.paths.plans,
-    ...(config.supervisor.model ? { supervisorModel: config.supervisor.model } : {}),
+    verbs: bridge.verbs,
+    ...(model.model ? { model: model.model } : {}),
   });
 
   supervisor = new Agent({
@@ -153,12 +223,20 @@ async function main(): Promise<void> {
     bus,
     sessionName: config.supervisor.sessionName,
     sessionDir: config.supervisor.sessionDir,
-    trustProjectFiles: config.trustProjectFiles,
-    appendSystemPrompt,
     extraArgs: config.supervisor.extraArgs,
+    // The bridge is how this session reaches state it does not own. The role decides
+    // which verbs the extension registers at all.
+    env: {
+      BAGEL_BRIDGE: bridge.path,
+      BAGEL_ROLE: "supervisor",
+      BAGEL_SESSION: config.session,
+    },
+    ...(policy ? { extension: policy.extension, noBuiltinTools: policy.noBuiltinTools, toolAllowlist: policy.allowlist } : {}),
+    ...(model.provider ? { provider: model.provider } : {}),
+    ...(model.model ? { model: model.model } : {}),
+    ...(model.thinking ? { thinking: model.thinking } : {}),
+    appendSystemPrompt,
     ...(config.piCli ? { cliPath: config.piCli } : {}),
-    ...(config.supervisor.provider ? { provider: config.supervisor.provider } : {}),
-    ...(config.supervisor.model ? { model: config.supervisor.model } : {}),
   });
 
   try {
@@ -166,19 +244,18 @@ async function main(): Promise<void> {
   } catch (error) {
     bus.emit({ type: "notice", level: "error", message: `cannot start pi: ${describe(error)}` });
     bus.emit({ type: "notice", level: "info", message: "is `pi` on PATH? otherwise set BAGEL_PI_CLI" });
-    return; // Leave the UI up so the message is readable.
+    return;
   }
 
-  // Prime with a small recall block rather than the whole journal. This is what makes
-  // a new session cheap to start.
+  // Prime with a small recall block rather than the whole journal. This is what makes a
+  // new session cheap to start.
   const recall = await notebook.recall({ recent: 15 });
   const priming = Notebook.formatRecall(recall, Date.now());
-  const summary = summarizeBacklog(backlog);
 
   const opening = [
     "Session start.",
     priming ? `\nRecall from your notebook:\n\n${priming}` : "\nYour notebook is empty.",
-    `\nBacklog (${adapter.name}):\n${summary}`,
+    `\nBacklog (${adapter.name}):\n${summarizeBacklog(backlog)}`,
     "\nGreet me in one line, name the single best next thing to work on, and say why.",
   ].join("\n");
 
