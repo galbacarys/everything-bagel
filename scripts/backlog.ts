@@ -93,9 +93,12 @@ if (asJson) {
   if (!tasks.length) {
     console.log("(no tasks; try --seed)");
   }
+  const stateById = new Map(tasks.map((task) => [task.id, task.state]));
   for (const task of tasks) {
     const notes: string[] = [];
-    if (task.blockedBy?.length) notes.push(`blocked by ${task.blockedBy.map((b) => `#${b}`).join(",")}`);
+    // Only unresolved blockers are worth naming; a landed one is history.
+    const unresolved = (task.blockedBy ?? []).filter((id) => stateById.get(id) !== "done");
+    if (unresolved.length) notes.push(`blocked by ${unresolved.map((b) => `#${b}`).join(",")}`);
     const claim = claims.find((c) => c.taskId === task.id);
     if (claim) notes.push(`held by ${claim.holder ?? claim.session}`);
     const suffix = notes.length ? `  (${notes.join("; ")})` : "";

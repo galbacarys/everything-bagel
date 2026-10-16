@@ -75,6 +75,9 @@ export function backlogContent(state: PaneState, height: number): string[] {
   const done = tasks.filter((t) => t.state === "done");
   const ordered = [...open, ...done];
 
+  // Resolution needs the whole task set, not just this row, so it is built once.
+  const stateById = new Map(tasks.map((task) => [task.id, task.state]));
+
   const rows = Math.max(0, height - 3);
   const firstVisible = Math.max(0, Math.min(state.selectedTask - rows + 1, ordered.length - rows));
   const slice = ordered.slice(firstVisible, firstVisible + rows);
@@ -89,7 +92,12 @@ export function backlogContent(state: PaneState, height: number): string[] {
     lines.push(`${pointer}${glyph} #${task.id} ${title}`);
 
     const notes: string[] = [];
-    if (task.blockedBy?.length) notes.push(`blocked by ${task.blockedBy.map((b) => `#${b}`).join(", ")}`);
+    if (task.blockedBy?.length) {
+      // A blocker that has landed is history, not a reason this task is stuck. Showing
+      // it anyway makes an unblocked task look blocked.
+      const unresolved = task.blockedBy.filter((id) => stateById.get(id) !== "done");
+      if (unresolved.length) notes.push(`blocked by ${unresolved.map((b) => `#${b}`).join(", ")}`);
+    }
     const claim = state.claims.get(task.id);
     if (claim) notes.push(`held by ${claim.holder ?? claim.session}`);
     else if (task.state === "claimed") notes.push("claim expired or unrecorded");
