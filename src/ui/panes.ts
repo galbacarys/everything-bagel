@@ -23,6 +23,8 @@ export interface PaneState {
   /** Why the tracker is unreachable, when it is. */
   trackerDetail?: string;
   selectedTask: number;
+  /** Index into the worker runs, not into `runs`. */
+  selectedRun: number;
   focus: FocusTarget;
   /** Set while the supervisor is mid-run, so the input line can say so. */
   supervisorBusy: boolean;
@@ -102,26 +104,59 @@ export function backlogContent(state: PaneState, height: number): string[] {
 // Agents
 // ---------------------------------------------------------------------------
 
+/** Worker runs, in dispatch order. The supervisor is not a worker. */
+export function workerRuns(runs: readonly AgentRun[]): AgentRun[] {
+  return runs.filter((run) => run.role !== "supervisor");
+}
+
 export function agentsContent(state: PaneState, height: number): string[] {
-  const workers = state.runs.filter((r) => r.role !== "supervisor");
+  const workers = workerRuns(state.runs);
   if (!workers.length) {
-    return [dim("No workers yet."), "", dim("After a plan is approved, the supervisor dispatches")];
+    return [
+      dim("No workers yet."),
+      "",
+      dim("Once a plan is approved the supervisor dispatches"),
+      dim("one into its own git worktree. Runs appear here"),
+      dim("live, and survive this session."),
+    ].slice(0, Math.max(1, height));
   }
 
+  const selected = state.focus === "agents" ? state.selectedRun : -1;
   const lines: string[] = [];
-  for (const run of workers) {
+
+  for (let index = 0; index < workers.length; index++) {
+    const run = workers[index]!;
     const role = run.role === "implementer" ? "impl" : run.role === "reviewer" ? "rev " : "sct ";
     const target = run.taskId ? `#${run.taskId}` : "—";
-    const status = statusCell(run);
+    const pointer = index === selected ? palette.accent("▌") : " ";
     const elapsed = formatDuration((run.endedAt ?? Date.now()) - run.startedAt);
-    const cost = `$${run.costUsd.toFixed(2)}`;
+    const cost = `$${run.costUsd.toFixed(3)}`;
+
     lines.push(
-      `${dim(role)} ${target.padEnd(5)} ${status} ${dim(elapsed.padStart(6))} ${dim(cost.padStart(6))} ${dim(`${run.turns}t`)}`,
+      `${pointer}${dim(role)} ${target.padEnd(5)} ${statusCell(run)} ${dim(
+        elapsed.padStart(6),
+      )} ${dim(cost.padStart(7))} ${dim(`${run.turns}t`)}`,
     );
-    if (run.lastTool) lines.push(`  ${palette.muted("⏺")} ${dim(run.lastTool)}`);
+
+    // The second line carries whatever is most useful right now: the tool being used
+    // while it works, or what it concluded once it stops.
+    if (run.status === "running" || run.status === "starting") {
+      if (run.lastTool) lines.push(`  ${palette.muted("⏺")} ${dim(run.lastTool)}`);
+    } else if (run.lastMessage) {
+      lines.push(`  ${dim(firstLine(run.lastMessage))}`);
+    }
   }
 
-  return tail(lines, height);
+  const body = tail(lines, Math.max(1, height - (state.focus === "agents" ? 1 : 0)));
+  if (state.focus === "agents") {
+    body.push(dim("  s steer   x abort   j/k select"));
+  }
+  return body;
+}
+
+function firstLine(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= 80 ? flat : `${flat.slice(0, 79)}…`;
 }
 
 function statusCell(run: AgentRun): string {

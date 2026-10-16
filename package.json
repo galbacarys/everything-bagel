@@ -16,6 +16,7 @@
     "smoke": "bun run scripts/smoke.ts",
     "preview": "bun run scripts/render-preview.ts",
     "backlog": "bun run scripts/backlog.ts",
+    "dispatch": "bun run scripts/dispatch.ts",
     "build": "bun build --compile --outfile dist/bagel src/main.ts"
   },
   "dependencies": {

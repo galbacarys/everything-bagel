@@ -341,16 +341,52 @@ dies with the task. There is no ambient auto-mode; autonomy is always task-scope
   context window, and lifetime — which is also what makes live `steer` and `abort`
   possible instead of rewriting a task file and relaunching.
 - **Completion = `agent_settled`**, never `agent_end`.
-- Each run gets a git worktree branched from `main` (§11).
-- Roles are markdown files with YAML frontmatter — `model`, `thinking`, `tools`,
-  `skills`, `extensions` — plus a system-prompt body, stored at `<state>/roles/`.
-  Hand-editable, diffable, and overridable per repo.
+- Each run gets a git worktree branched from the default branch (`main` where it
+exists, else `origin/HEAD`). Worktrees live under the state directory, outside the
+repository, so agent work never appears in the main checkout's status, in file pickers,
+or in search results. The tradeoff is that an editor rooted at the main checkout will not
+index them until it opens them explicitly.
+- Roles are markdown files with YAML frontmatter — `model`, `provider`, `thinking`,
+  `tools` — plus a system-prompt body, stored at `<state>/roles/`. Hand-editable and
+  diffable. Defaults are written on first run and never overwritten afterwards.
 - Cheap models implement; expensive models plan and review. Verified as a real cost
   lever by `jev-router`.
 - **Independent review earns its cost.** A separate process, separate context, and a
   separate model catches what the author's own pass cannot, precisely because it did
   not write the code. The reviewer is read-only.
 - Worker reports stay on disk (`<state>/runs/<id>/`); only a `Brief` crosses back.
+
+### A run's artifacts
+
+```
+<state>/runs/<run-id>/
+  task.md         the exact prompt, written before the child existed
+  events.jsonl    the raw protocol stream, the authoritative record
+  report.md       the final assistant message, derived from that stream
+  meta.json       role, task, model, status, turns, cost, timings, verdict
+```
+
+`meta.json` is written to a temporary name and renamed, so a crash mid-write cannot leave
+a half-parsed file that the aggregator then trips over. It is written once before the worker
+starts and again when it finishes, which is what makes an interrupted run visible instead
+of invisible.
+
+The point of `meta.json` is that cost analysis needs no other persistence: rolling up spend
+by role, model, or project is a pure aggregation over these files. See `rollUp()`.
+
+### Ending a run
+
+A run ends in three steps, and the order matters:
+
+1. `run.settled` — the child stopped.
+2. The report is written and `meta.json` updated with final cost and turns.
+3. `run.brief` — a short summary, pushed into the supervisor's conversation.
+
+Anything waiting on the outcome should wait for the brief rather than for settling.
+
+Removing a worktree is the one genuinely destructive act in this layer, so `drop()` refuses
+when the tree holds uncommitted changes or commits not on the base branch, and keeps the
+branch unless asked otherwise.
 
 ## 9. v1 scope — supervisor + backlog spine
 

@@ -9,6 +9,7 @@
 
 import { writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { Roster } from "../exec/roster.ts";
 import type { BridgeHandlers } from "../ipc/bridge.ts";
 import type { Notebook } from "../notebook/store.ts";
 import type { Backlog } from "../tracker/backlog.ts";
@@ -19,6 +20,7 @@ import type { GateQueue } from "./gates.ts";
 export interface VerbContext {
   backlog: Backlog;
   notebook: Notebook;
+  roster: Roster;
   gates: GateQueue;
   /** Directory plans are written to. */
   plansPath: string;
@@ -264,6 +266,131 @@ export function buildHandlers(context: VerbContext): BridgeHandlers {
         },
         bridgeContext.signal,
       );
+    },
+
+    // -- dispatch -----------------------------------------------------------
+
+    "dispatch.start": async (raw) => {
+      const args = asObject(raw);
+      const role = (optionalString(args, "role") ?? "implementer") as Role;
+      if (role === "supervisor") {
+        throw new ArgumentError("the supervisor cannot dispatch itself");
+      }
+
+      const task = optionalString(args, "task");
+      const planSlug = optionalString(args, "planSlug");
+      if (!task && !planSlug) {
+        throw new ArgumentError(
+          "provide `planSlug` for an approved plan, or `task` for a self-contained instruction",
+        );
+      }
+
+      const record = await context.roster.start({
+        role,
+        ...(task ? { task } : {}),
+        ...(planSlug ? { planSlug } : {}),
+        ...(optionalString(args, "taskId") ? { taskId: optionalString(args, "taskId")! } : {}),
+        ...(optionalString(args, "slug") ? { slug: optionalString(args, "slug")! } : {}),
+        ...(optionalString(args, "base") ? { base: optionalString(args, "base")! } : {}),
+        ...(optionalString(args, "reuseWorktree")
+          ? { reuseWorktree: optionalString(args, "reuseWorktree")! }
+          : {}),
+      });
+
+      const taskId = record.meta.taskId;
+      await notebook.append({
+        actor: context.role,
+        kind: "work",
+        body: `Dispatched ${role} as ${record.meta.id} on ${record.meta.branch ?? "a worktree"}`,
+        tags: [...(taskId ? [taskId] : []), "dispatch"],
+        ...(taskId ? { taskId } : {}),
+      });
+
+      return {
+        runId: record.meta.id,
+        role: record.meta.role,
+        branch: record.meta.branch,
+        worktree: record.meta.worktree,
+        model: record.meta.model,
+        thinking: record.meta.thinking,
+      };
+    },
+
+    "dispatch.status": async (raw) => {
+      const args = asObject(raw);
+      const runId = optionalString(args, "runId");
+      const records = runId
+        ? [context.roster.get(runId)].filter((record) => record !== undefined)
+        : context.roster.records;
+      if (runId && records.length === 0) throw new ArgumentError(`unknown run: ${runId}`);
+
+      return {
+        active: context.roster.active.length,
+        runs: records.map((record) => ({
+          runId: record.meta.id,
+          role: record.meta.role,
+          taskId: record.meta.taskId,
+          status: record.meta.status,
+          branch: record.meta.branch,
+          worktree: record.meta.worktree,
+          model: record.meta.model,
+          turns: record.meta.turns,
+          costUsd: record.meta.costUsd,
+          startedAt: record.meta.startedAt,
+          endedAt: record.meta.endedAt,
+          verdict: record.meta.verdict,
+          lastTool: record.run?.lastTool,
+          finished: record.finished,
+          // Only the summary crosses back. The full report is one call away.
+          brief: record.brief?.summary,
+        })),
+      };
+    },
+
+    "dispatch.report": async (raw) => {
+      const args = asObject(raw);
+      const runId = requiredString(args, "runId");
+      const record = context.roster.get(runId);
+      if (!record) throw new ArgumentError(`unknown run: ${runId}`);
+      return {
+        runId,
+        status: record.meta.status,
+        report: record.report ?? "(no report yet; the run may still be working)",
+        reportPath: record.meta.reportPath,
+      };
+    },
+
+    "dispatch.steer": async (raw) => {
+      const args = asObject(raw);
+      await context.roster.steer(requiredString(args, "runId"), requiredString(args, "message"));
+      return { ok: true };
+    },
+
+    "dispatch.abort": async (raw) => {
+      const args = asObject(raw);
+      await context.roster.abort(requiredString(args, "runId"));
+      return { ok: true };
+    },
+
+    "dispatch.drop": async (raw) => {
+      const args = asObject(raw);
+      const runId = requiredString(args, "runId");
+      const force = args["force"] === true;
+      const record = context.roster.get(runId);
+      const result = await context.roster.drop(runId, {
+        force,
+        deleteBranch: args["deleteBranch"] === true,
+      });
+      if (result.removed) {
+        await notebook.append({
+          actor: context.role,
+          kind: "work",
+          body: `Removed the worktree for ${runId}${result.branchDeleted ? ` (branch ${result.branchDeleted} deleted)` : ""}`,
+          tags: ["dispatch"],
+          ...(record?.meta.taskId ? { taskId: record.meta.taskId } : {}),
+        });
+      }
+      return result;
     },
   };
 }

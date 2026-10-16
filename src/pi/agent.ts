@@ -45,6 +45,8 @@ export interface AgentOptions {
   appendSystemPrompt?: string;
   extraArgs?: string[];
   env?: Record<string, string>;
+  /** Every raw protocol event, in order. Used to persist a run's transcript. */
+  onRawEvent?: (event: unknown) => void;
 }
 
 let runCounter = 0;
@@ -58,10 +60,12 @@ export class Agent {
   readonly run: AgentRun;
   readonly #client: RpcClient;
   readonly #bus: Bus;
+  readonly #onRawEvent: ((event: unknown) => void) | undefined;
   #unsubscribe: (() => void) | undefined;
 
   constructor(options: AgentOptions) {
     this.#bus = options.bus;
+    this.#onRawEvent = options.onRawEvent;
 
     const args: string[] = [];
     if (options.ephemeral) args.push("--no-session");
@@ -107,6 +111,12 @@ export class Agent {
     await this.#client.start();
     this.run.status = "running";
     this.#unsubscribe = this.#client.onEvent((event) => {
+      // Log first, so the transcript is complete even if translation throws.
+      try {
+        this.#onRawEvent?.(event);
+      } catch {
+        // A logging failure must not derail the run.
+      }
       translate(this.run, event, this.#bus);
     });
     this.#bus.emit({ type: "run.started", run: this.run });
@@ -123,6 +133,16 @@ export class Agent {
   /** Inject guidance into a run that is already working. */
   async steer(message: string): Promise<void> {
     await this.#client.steer(message);
+  }
+
+  /**
+   * Queue a message for after the current turn, without interrupting it.
+   *
+   * The right way to deliver a brief to a supervisor that is mid-thought: steering would
+   * cut into what it is doing, and prompting would be rejected while it is busy.
+   */
+  async followUp(message: string): Promise<void> {
+    await this.#client.followUp(message);
   }
 
   async abort(): Promise<void> {

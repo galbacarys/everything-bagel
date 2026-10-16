@@ -32,8 +32,9 @@ dispatch, and the plan-approval loop. See the build plan.
 ```sh
 bun install
 bun start              # the control room
-bun test               # parsers, claim protocol, expiry, contention
+bun test               # parsers, claim protocol, gates, worktrees, roll-up
 bun run smoke          # headless check that the pi integration works
+bun run dispatch       # headless check that a worker runs in its own worktree
 bun run backlog        # inspect this repo's tracker from the terminal
 bun run preview 150 42 # render the UI to stdout at a fixed size
 ```
@@ -58,6 +59,27 @@ comment. See "The claim protocol" in the design.
 
 When the tracker is unreachable, bagel says why in the header and falls back to an
 in-memory backlog rather than showing a blank pane.
+
+## Dispatch
+
+The supervisor does not implement. It dispatches, and reads what comes back.
+
+A dispatch resolves the role, creates a git worktree under the state directory, writes the
+task to disk, and only then spawns one `pi --mode rpc` child confined to that worktree.
+Writing the task first means a run that dies on arrival still says what it was asked to do.
+
+- Worktrees live **outside** the repository, so agent work never shows up in the main
+  checkout's status, in file pickers, or in search results.
+- Each run leaves `task.md`, `events.jsonl`, `report.md`, and `meta.json` in
+  `<state>/runs/<run-id>/`. Only a short summary — a *brief* — crosses back into the
+  supervisor's context; the full report stays on disk.
+- `meta.json` carries cost, turns, model, role, and timings, so cost analysis is a pure
+  aggregation over those files rather than a separate store.
+- Removing a worktree is the one destructive act here, so it refuses when the tree holds
+  uncommitted changes or commits not on the base branch, and keeps the branch unless asked
+  otherwise.
+- Roles are editable markdown at `<state>/roles/*.md` with frontmatter, written on first
+  run and never overwritten.
 
 ## Docs
 

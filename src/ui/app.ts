@@ -10,7 +10,15 @@
  *   - Nothing here imports from `pi/` or `tracker/`. State arrives as domain events.
  */
 
-import { Input, Key, Markdown, matchesKey, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import {
+  Input,
+  Key,
+  Markdown,
+  matchesKey,
+  truncateToWidth,
+  visibleWidth,
+  type Component,
+} from "@earendil-works/pi-tui";
 import type { Bus, DomainEvent } from "../domain/events.ts";
 import type { AgentRun, GateRequest } from "../domain/types.ts";
 import { columns, frame } from "./layout.ts";
@@ -19,6 +27,7 @@ import {
   backlogContent,
   headerLine,
   notebookContent,
+  workerRuns,
   type FocusTarget,
   type PaneId,
   type PaneState,
@@ -40,6 +49,11 @@ const FOCUS_ORDER: FocusTarget[] = ["prompt", ...PANE_ORDER];
 const MAX_JOURNAL = 200;
 const MAX_SUPERVISOR_TEXT = 200_000;
 
+function firstLine(text: string, max = 120): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+}
+
 export class App implements Component {
   #state: PaneState;
   #input: Input;
@@ -54,6 +68,8 @@ export class App implements Component {
   #notice: { level: "info" | "warn" | "error"; message: string } | undefined;
   /** Gates awaiting an answer, oldest first. The input line is replaced while one is open. */
   #gates: GateRequest[] = [];
+  /** Set while the input line is composing a steering message for a run. */
+  #steerTarget: string | undefined;
   #focused = false;
   #unsubscribe: () => void;
 
@@ -61,6 +77,9 @@ export class App implements Component {
   onQuit?: () => void;
   /** Called when a human answers a gate. bagel owns the pending gate, not the UI. */
   onGateAnswer?: (id: string, accepted: boolean) => void;
+  /** Steering reuses the input line rather than adding a second text entry point. */
+  onSteer?: (runId: string, message: string) => void;
+  onAbort?: (runId: string) => void;
 
   constructor(options: AppOptions) {
     this.#height = options.height;
@@ -76,6 +95,7 @@ export class App implements Component {
       trackerName: "connecting…",
       trackerLive: false,
       selectedTask: 0,
+      selectedRun: 0,
       focus: "prompt",
       supervisorBusy: false,
     };
@@ -89,7 +109,10 @@ export class App implements Component {
       const text = value.trim();
       if (!text) return;
       this.#input.setValue("");
-      this.onSubmit?.(text);
+      const target = this.#steerTarget;
+      this.#steerTarget = undefined;
+      if (target) this.onSteer?.(target, text);
+      else this.onSubmit?.(text);
       this.#requestRender();
     };
 
@@ -122,6 +145,7 @@ export class App implements Component {
   #apply(event: DomainEvent): void {
     switch (event.type) {
       case "run.started":
+      case "run.dispatched":
       case "run.updated":
       case "run.settled": {
         this.#upsertRun(event.run);
@@ -129,6 +153,17 @@ export class App implements Component {
           this.#supervisorRunId = event.run.id;
           this.#state.supervisorBusy = event.run.status === "running";
         }
+        // Runs come and go, so the selection has to be re-clamped or it points past the
+        // end of the list.
+        const workers = workerRuns(this.#state.runs).length;
+        this.#state.selectedRun = Math.max(0, Math.min(workers - 1, this.#state.selectedRun));
+        break;
+      }
+
+      case "run.brief": {
+        // A finished run is worth surfacing: the reason to watch a herd is to notice the
+        // one that stopped.
+        this.#notice = { level: "info", message: `${event.brief.runId}: ${firstLine(event.brief.summary)}` };
         break;
       }
 
@@ -268,6 +303,16 @@ export class App implements Component {
       this.#moveSelection(-1);
       return;
     }
+    if (this.#state.focus === "agents") {
+      if (data === "s") {
+        this.#beginSteer();
+        return;
+      }
+      if (data === "x") {
+        this.#abortSelected();
+        return;
+      }
+    }
     if (matchesKey(data, Key.enter)) {
       this.#activateSelection();
       return;
@@ -275,6 +320,26 @@ export class App implements Component {
     if (data === "q") {
       this.onQuit?.();
     }
+  }
+
+  /** The worker run currently selected in the agents pane. */
+  #selectedRun(): AgentRun | undefined {
+    return workerRuns(this.#state.runs)[this.#state.selectedRun];
+  }
+
+  #beginSteer(): void {
+    const run = this.#selectedRun();
+    if (!run) return;
+    this.#steerTarget = run.id;
+    this.#input.setValue("");
+    this.#state.focus = "prompt";
+    this.#requestRender();
+  }
+
+  #abortSelected(): void {
+    const run = this.#selectedRun();
+    if (!run) return;
+    this.onAbort?.(run.id);
   }
 
   #cycleFocus(delta: number): void {
@@ -289,6 +354,11 @@ export class App implements Component {
       const count = this.#state.tasks.length;
       if (count > 0) {
         this.#state.selectedTask = Math.max(0, Math.min(count - 1, this.#state.selectedTask + delta));
+      }
+    } else if (this.#state.focus === "agents") {
+      const count = workerRuns(this.#state.runs).length;
+      if (count > 0) {
+        this.#state.selectedRun = Math.max(0, Math.min(count - 1, this.#state.selectedRun + delta));
       }
     }
     this.#requestRender();
@@ -348,8 +418,16 @@ export class App implements Component {
     return lines.slice(0, screenHeight);
   }
 
-  /** The bottom line is the input, unless a gate has taken it over. */
+  /** The bottom line is the input, unless a gate or a steer has taken it over. */
   #footerLine(width: number): string {
+    const target = this.#steerTarget;
+    if (target) {
+      const badge = `${palette.accent("STEER")} ${dim(target)} ${palette.muted("›")} `;
+      const badgeWidth = visibleWidth(badge);
+      const inputLine = this.#input.render(Math.max(10, width - badgeWidth))[0] ?? "";
+      return truncateToWidth(badge + inputLine, width, "…", true);
+    }
+
     const gate = this.#gates[0];
     if (!gate) return this.#input.render(width)[0] ?? "";
 

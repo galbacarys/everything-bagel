@@ -6,12 +6,14 @@
  * knows about the other, and neither side knows about pi.
  */
 
-import type { AgentRun, Claim, GateRequest, JournalEntry, Task } from "./types.ts";
+import type { AgentRun, Brief, Claim, GateRequest, JournalEntry, Task } from "./types.ts";
 
 export type DomainEvent =
   // Execution plane
   | { type: "run.started"; run: AgentRun }
+  | { type: "run.dispatched"; run: AgentRun }
   | { type: "run.updated"; run: AgentRun }
+  | { type: "run.brief"; brief: Brief }
   | { type: "run.delta"; runId: string; text: string }
   | { type: "run.tool"; runId: string; tool: string }
   | { type: "run.settled"; run: AgentRun }

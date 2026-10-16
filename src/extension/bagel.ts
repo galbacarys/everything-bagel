@@ -354,6 +354,131 @@ const ALL_TOOLS: ToolSpec[] = [
       return `DECLINED by the human.${view.note ? ` ${view.note}` : ""} Stop and wait for new instructions; do not proceed on your own reasoning.`;
     },
   },
+  {
+    name: "dispatch_start",
+    label: "Dispatch a worker",
+    description:
+      "Start a worker in its own git worktree, on its own branch, with its own context window. Pass `planSlug` to hand it an approved plan, or `task` for a self-contained instruction. Returns as soon as the worker is running, so do not wait on it: plan the next thing, and you will receive a brief when this one finishes.",
+    parameters: Type.Object({
+      role: Type.Union([Type.Literal("implementer"), Type.Literal("reviewer"), Type.Literal("scout")], {
+        description: "What kind of worker.",
+      }),
+      planSlug: Type.Optional(
+        Type.String({ description: "Slug of an approved plan in the plans directory, embedded into the task." }),
+      ),
+      task: Type.Optional(Type.String({ description: "Self-contained instruction, when there is no plan." })),
+      taskId: Type.Optional(Type.String({ description: "Task this run is for." })),
+      slug: Type.Optional(Type.String({ description: "Branch-name slug. Defaults to the plan slug or task id." })),
+      base: Type.Optional(
+        Type.String({ description: "Base ref to branch from. Defaults to the repository default branch." }),
+      ),
+      reuseWorktree: Type.Optional(
+        Type.String({ description: "Continue in an existing run's worktree instead of creating a new one." }),
+      ),
+    }),
+    verb: "dispatch.start",
+    render: (result) => {
+      const view = result as { runId: string; role: string; branch?: string; worktree?: string; model?: string };
+      return [
+        `Started ${view.runId} (${view.role}).`,
+        view.worktree ? `worktree: ${view.worktree}` : "",
+        view.branch ? `branch: ${view.branch}` : "",
+        view.model ? `model: ${view.model}` : "",
+        "It runs in the background. You will get a brief when it finishes; do not block on it.",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    },
+  },
+  {
+    name: "dispatch_status",
+    label: "Check on workers",
+    description:
+      "List every run this session has dispatched, with status, cost, turns, and the brief from any that finished. Finished runs also send you a brief, so you do not need to poll this.",
+    parameters: Type.Object({
+      runId: Type.Optional(Type.String({ description: "Just this run. Omit for all of them." })),
+    }),
+    verb: "dispatch.status",
+    render: (result) => {
+      const view = result as {
+        active: number;
+        runs: Array<{
+          runId: string;
+          role: string;
+          taskId?: string;
+          status: string;
+          turns: number;
+          costUsd: number;
+          lastTool?: string;
+          verdict?: string;
+          brief?: string;
+        }>;
+      };
+      if (!view.runs.length) return "No runs have been dispatched.";
+      return view.runs
+        .map((run) => {
+          const head = `${run.runId} ${run.role}${run.taskId ? ` #${run.taskId}` : ""} [${run.status}]${run.verdict ? ` ${run.verdict}` : ""} ${run.turns}t $${run.costUsd.toFixed(4)}${run.lastTool ? ` \u00b7 ${run.lastTool}` : ""}`;
+          return run.brief ? `${head}\n${run.brief}` : head;
+        })
+        .join("\n\n");
+    },
+  },
+  {
+    name: "dispatch_report",
+    label: "Read a worker's report",
+    description:
+      "Read a finished run's full report. You already receive a short brief; use this only when the brief is not enough to decide something.",
+    parameters: Type.Object({ runId: Type.String({ description: "The run to read." }) }),
+    verb: "dispatch.report",
+    render: (result) => {
+      const view = result as { runId: string; status: string; report: string };
+      return `${view.runId} [${view.status}]\n\n${view.report}`;
+    },
+  },
+  {
+    name: "dispatch_steer",
+    label: "Steer a running worker",
+    description:
+      "Send guidance into a run that is already working, without restarting it. Use this to correct or unblock a worker rather than aborting and dispatching again.",
+    parameters: Type.Object({
+      runId: Type.String({ description: "The run to steer." }),
+      message: Type.String({ description: "The guidance: the blocker, the decision, and the current state." }),
+    }),
+    verb: "dispatch.steer",
+    render: () => "Steering message delivered.",
+  },
+  {
+    name: "dispatch_abort",
+    label: "Abort a worker",
+    description:
+      "Stop a running worker. Its worktree and branch are kept, so the work so far stays recoverable. Prefer steering when a worker is merely going off track.",
+    parameters: Type.Object({ runId: Type.String({ description: "The run to abort." }) }),
+    verb: "dispatch.abort",
+    render: () => "Abort requested. The worktree and its branch are kept.",
+  },
+  {
+    name: "dispatch_drop",
+    label: "Remove a worker's worktree",
+    description:
+      "Remove a finished run's worktree. Refuses when the tree holds uncommitted changes or commits not on the base branch, because that work would be lost. The branch is kept unless you explicitly ask for it to be deleted.",
+    parameters: Type.Object({
+      runId: Type.String({ description: "The run whose worktree should go." }),
+      force: Type.Optional(Type.Boolean({ description: "Discard uncommitted work. Only when you are certain." })),
+      deleteBranch: Type.Optional(Type.Boolean({ description: "Also delete the branch. Defaults to false." })),
+    }),
+    verb: "dispatch.drop",
+    render: (result) => {
+      const view = result as {
+        removed: boolean;
+        reason?: string;
+        state?: { changes: string[]; committedAhead: number; branch?: string };
+      };
+      if (view.removed) {
+        return `Worktree removed.${view.state?.branch ? ` Branch ${view.state.branch} kept.` : ""}`;
+      }
+      return `Refused: ${view.reason ?? "work would be lost"}`;
+    },
+  },
 ];
 
 /** Which verbs each role may use. A role that lacks a verb cannot call it at all. */
@@ -370,6 +495,12 @@ const ROLE_TOOLS: Record<Role, string[]> = {
     "notebook_search",
     "plan_write",
     "gate_request",
+    "dispatch_start",
+    "dispatch_status",
+    "dispatch_report",
+    "dispatch_steer",
+    "dispatch_abort",
+    "dispatch_drop",
   ],
   // Workers record what they learn but do not touch the coordination plane. The
   // supervisor owns the backlog so there is one place decisions are made.

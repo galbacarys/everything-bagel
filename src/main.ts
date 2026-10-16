@@ -15,6 +15,8 @@ import { join } from "node:path";
 import { Container, ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { resolveConfig, tierFor } from "./config.ts";
 import { Bus } from "./domain/events.ts";
+import { ensureRoleFiles } from "./exec/roles.ts";
+import { Roster } from "./exec/roster.ts";
 import { BridgeServer } from "./ipc/bridge.ts";
 import { Notebook } from "./notebook/store.ts";
 import { Agent } from "./pi/agent.ts";
@@ -83,6 +85,7 @@ async function main(): Promise<void> {
   let supervisor: Agent | undefined;
   let backlog: Backlog | undefined;
   let bridge: BridgeServer | undefined;
+  let roster: Roster | undefined;
 
   const shutdown = async (code = 0): Promise<void> => {
     if (shuttingDown) return;
@@ -91,6 +94,12 @@ async function main(): Promise<void> {
     // was going to answer it.
     gates.cancelAll("bagel is shutting down");
     backlog?.stop();
+    try {
+      await roster?.stopAll();
+      roster?.dispose();
+    } catch {
+      // Best effort.
+    }
     try {
       await bridge?.close();
     } catch {
@@ -175,16 +184,91 @@ async function main(): Promise<void> {
     bus.emit({ type: "notebook.appended", entry });
   }
 
-  // -- bridge ---------------------------------------------------------------
+  // -- dispatch -------------------------------------------------------------
 
   const extensionPath = resolveExtensionPath();
   const policy = extensionPath ? toolPolicyFor("supervisor", extensionPath) : undefined;
+
+  // Written once, never overwritten, so an edited role survives an upgrade.
+  const roleFiles = await ensureRoleFiles(config.paths.roles);
+  if (roleFiles.length) {
+    bus.emit({ type: "notice", level: "info", message: `wrote default roles to ${config.paths.roles}` });
+  }
+
+  roster = new Roster({
+    bus,
+    paths: config.paths,
+    session: config.session,
+    models: config.models,
+    ...(extensionPath ? { extensionPath } : {}),
+    ...(config.piCli ? { piCli: config.piCli } : {}),
+    onError: (error, request) => {
+      bus.emit({ type: "notice", level: "error", message: `${request.role}: ${describe(error)}` });
+    },
+    onBrief: (brief) => {
+      void (async () => {
+        const kind = brief.kind === "verdict" ? "verdict" : brief.kind === "blocker" ? "blocker" : "work";
+        const entry = await notebook.append({
+          actor: brief.runId,
+          kind,
+          body: `${brief.runId} finished: ${firstLine(brief.summary)}`,
+          tags: [...(brief.taskId ? [brief.taskId] : []), "brief"],
+          ...(brief.taskId ? { taskId: brief.taskId } : {}),
+        });
+        bus.emit({ type: "notebook.appended", entry });
+
+        // Push it, do not wait to be asked. A brief nobody reads is just a log line.
+        const current = supervisor;
+        if (!current) return;
+        const message = `[bagel] ${brief.runId} finished (${brief.kind}).\n\n${brief.summary}`;
+        try {
+          // followUp when busy: steering would cut into what it is doing, and a prompt
+          // would be rejected outright mid-turn.
+          if (current.busy) await current.followUp(message);
+          else await current.prompt(message);
+        } catch (error) {
+          bus.emit({ type: "notice", level: "error", message: `brief delivery failed: ${describe(error)}` });
+        }
+      })();
+    },
+  });
+
+  app.onSteer = (runId, message) => {
+    void (async () => {
+      try {
+        await roster?.steer(runId, message);
+        const entry = await notebook.append({
+          actor: "human",
+          kind: "decision",
+          body: `Steered ${runId}: ${firstLine(message)}`,
+          tags: ["steer"],
+        });
+        bus.emit({ type: "notebook.appended", entry });
+      } catch (error) {
+        bus.emit({ type: "notice", level: "error", message: `steer failed: ${describe(error)}` });
+      }
+    })();
+  };
+
+  app.onAbort = (runId) => {
+    void (async () => {
+      try {
+        await roster?.abort(runId);
+        bus.emit({ type: "notice", level: "warn", message: `aborting ${runId}` });
+      } catch (error) {
+        bus.emit({ type: "notice", level: "error", message: `abort failed: ${describe(error)}` });
+      }
+    })();
+  };
+
+  // -- bridge ---------------------------------------------------------------
 
   bridge = new BridgeServer({
     path: join(config.paths.root, "bridge.sock"),
     handlers: buildHandlers({
       backlog,
       notebook,
+      roster,
       gates,
       plansPath: config.paths.plans,
       session: config.session,
@@ -285,6 +369,11 @@ function summarizeBacklog(backlog: Backlog): string {
 function describe(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message.split("\n")[0] ?? message;
+}
+
+function firstLine(text: string, max = 120): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 }
 
 main().catch((error: unknown) => {

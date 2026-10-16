@@ -13,7 +13,6 @@
  *     verb names must be listed or they are registered but inactive.
  */
 
-import type { ModelChoice } from "../config.ts";
 import type { Role } from "../domain/types.ts";
 
 export interface ToolPolicy {
@@ -21,12 +20,15 @@ export interface ToolPolicy {
   extension: string;
   /** Disable every built-in tool before the allowlist is applied. */
   noBuiltinTools: boolean;
-  /** Comma-separated allowlist of tool names and patterns. */
-  allowlist: string;
+  /**
+   * Comma-separated allowlist of tool names and patterns. Undefined means no allowlist,
+   * so every registered tool stays active.
+   */
+  allowlist?: string;
 }
 
 /** Verbs the supervisor gets, by prefix plus the two privileged singletons. */
-const SUPERVISOR_VERBS = "backlog_*,notebook_*,plan_write,gate_request";
+const SUPERVISOR_VERBS = "backlog_*,notebook_*,dispatch_*,plan_write,gate_request";
 
 /**
  * The supervisor keeps `read` and nothing else built-in.
@@ -44,21 +46,12 @@ export function toolPolicyFor(role: Role, extensionPath: string): ToolPolicy {
     };
   }
 
-  // Workers still get the ordinary coding tools; they are the ones supposed to be
-  // editing files. What they do not get is the coordination plane beyond reading it.
+  // Workers get the ordinary coding tools, because they are the ones supposed to be
+  // editing files. No allowlist: narrowing a worker's tools is the role definition's job,
+  // and a worker that cannot read a file is not a worker.
   return {
     extension: extensionPath,
     noBuiltinTools: false,
-    allowlist: `*,${SUPERVISOR_VERBS}`,
   };
 }
 
-/**
- * Model defaults. Exactly two levels, on purpose: a supervisor that plans, and workers
- * that execute. More tiers than that is a tuning problem pretending to be a feature.
- */
-export const MODEL_DEFAULTS = {
-  supervisor: { thinking: "high" } as ModelChoice,
-  implementer: { thinking: "low" } as ModelChoice,
-  reviewer: { thinking: "medium" } as ModelChoice,
-} satisfies Record<string, ModelChoice>;
