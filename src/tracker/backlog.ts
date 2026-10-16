@@ -138,23 +138,39 @@ export class Backlog {
 
   // -- mutations ------------------------------------------------------------
   //
-  // Every mutation refreshes, so the pane reflects the tracker's own view rather than
-  // an optimistic guess about what the tracker did.
+  // Mutations apply locally first and then reconcile, rather than awaiting a re-read.
+  // Two reasons: the pane reacts immediately, and a just-written change is visible even
+  // if the tracker's own read path is briefly stale.
 
   async create(task: NewTask): Promise<Task> {
     const created = await this.adapter.create(task);
-    await this.refresh();
+    this.#applyLocal(created);
+    void this.refresh();
     return created;
   }
 
   async transition(id: TaskId, state: TaskState): Promise<Task> {
     const updated = await this.adapter.transition(id, state);
-    await this.refresh();
+    this.#applyLocal(updated);
+    void this.refresh();
     return updated;
   }
 
   async comment(id: TaskId, body: string): Promise<void> {
     await this.adapter.comment(id, body);
+  }
+
+  /** Fold a known change into the cache and publish it. */
+  #applyLocal(task: Task): void {
+    const index = this.#tasks.findIndex((existing) => existing.id === task.id);
+    const next = [...this.#tasks];
+    if (index >= 0) next[index] = task;
+    else next.unshift(task);
+    this.#tasks = next;
+    // A locally-applied change is only true because the tracker accepted it, so the
+    // tracker is reachable by definition.
+    this.#live = true;
+    this.#bus.emit({ type: "backlog.updated", tasks: this.#tasks, claims: this.#claims });
   }
 }
 

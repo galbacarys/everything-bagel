@@ -197,6 +197,7 @@ interface GhIssue {
   labels?: unknown;
   assignees?: unknown;
   comments?: unknown;
+  updatedAt?: unknown;
 }
 
 const ISSUE_FIELDS = "number,title,body,state,url,labels,assignees,updatedAt";
@@ -209,6 +210,10 @@ function labelNames(value: unknown): string[] {
   return asArray<GhLabel | string>(value)
     .map((label) => (typeof label === "string" ? label : typeof label.name === "string" ? label.name : undefined))
     .filter((name): name is string => Boolean(name));
+}
+
+function timestampOf(value: unknown): number {
+  return typeof value === "string" ? Date.parse(value) || 0 : 0;
 }
 
 /**
@@ -324,14 +329,24 @@ export interface GitHubTrackerOptions {
   timeoutMs?: number;
 }
 
-/** Label definitions, created on demand so a fresh repository looks intentional. */
+/**
+ * Labels bagel uses for its own bookkeeping, created on demand so a fresh repository
+ * looks intentional. Any other label the caller names is created too, but never
+ * restyled — see `#ensureLabel`.
+ */
 const LABEL_META: Array<{ name: string; color: string; description: string }> = [
   { name: LABEL.ready, color: "0e8a16", description: "bagel: ready to be picked up" },
   { name: LABEL.inProgress, color: "fbca04", description: "bagel: claimed by a bagel session" },
   { name: LABEL.inReview, color: "1d76db", description: "bagel: under review" },
   { name: LABEL.blocked, color: "b60205", description: "bagel: blocked on something else" },
   { name: LABEL.laneProd, color: "5319e7", description: "bagel: touches deploy or migrations; serialized" },
+  { name: "type:feat", color: "a2eeef", description: "bagel: new capability" },
+  { name: "type:fix", color: "d73a4a", description: "bagel: defect" },
+  { name: "type:chore", color: "cfd3d7", description: "bagel: maintenance" },
+  { name: "type:docs", color: "0075ca", description: "bagel: documentation" },
 ];
+
+const DEFAULT_LABEL_COLOR = "ededed";
 
 export class GitHubTracker implements TrackerAdapter, ClaimCapable {
   readonly name: string;
@@ -339,7 +354,7 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
   readonly #cwd: string | undefined;
   readonly #claimTtlMs: number;
   readonly #timeoutMs: number;
-  #labelsEnsured: Promise<void> | undefined;
+  readonly #ensuredLabels = new Set<string>();
   #viewer: string | undefined;
 
   constructor(options: GitHubTrackerOptions) {
@@ -382,27 +397,38 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
     }
   }
 
-  /** Create or update the labels bagel relies on. Runs once per process. */
-  async ensureLabels(): Promise<void> {
-    this.#labelsEnsured ??= (async () => {
-      for (const meta of LABEL_META) {
-        try {
-          await this.#gh([
-            "label",
-            "create",
-            meta.name,
-            "--color",
-            meta.color,
-            "--description",
-            meta.description,
-            "--force",
-          ]);
-        } catch {
-          // A missing label is not fatal; transitions degrade to partial success.
-        }
-      }
-    })();
-    return this.#labelsEnsured;
+  /**
+   * Create one label if it is missing.
+   *
+   * Labels bagel owns are forced to bagel's color and description, so an upgrade can
+   * restyle them. Any other label is created plainly and never restyled: a repository's
+   * existing labels are the repository's business.
+   */
+  async #ensureLabel(name: string): Promise<void> {
+    if (this.#ensuredLabels.has(name)) return;
+    // Recorded as attempted either way. A label we cannot create is not a reason to
+    // retry on every call; `create()` and `transition()` degrade instead.
+    this.#ensuredLabels.add(name);
+
+    const meta = LABEL_META.find((entry) => entry.name === name);
+    const args = ["label", "create", name];
+    if (meta) {
+      args.push("--color", meta.color, "--description", meta.description, "--force");
+    } else {
+      args.push("--color", DEFAULT_LABEL_COLOR, "--description", "created by bagel");
+    }
+
+    try {
+      await this.#gh(args);
+    } catch {
+      // Either it already existed (fine) or we lack permission (the callers cope).
+    }
+  }
+
+  /** Create or update every label bagel needs, plus any the caller names. */
+  async ensureLabels(extra: string[] = []): Promise<void> {
+    const wanted = new Set<string>([...LABEL_META.map((entry) => entry.name), ...extra]);
+    await Promise.all([...wanted].map((name) => this.#ensureLabel(name)));
   }
 
   async list(filter: TaskFilter = {}): Promise<Task[]> {
@@ -415,8 +441,6 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
       "all",
       "--limit",
       String(limit),
-      "--search",
-      "sort:updated-desc",
       "--json",
       ISSUE_FIELDS,
     ];
@@ -424,7 +448,15 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
     for (const label of filter.labels ?? []) args.push("--label", label);
 
     const raw = await this.#gh(args);
-    const partial = (JSON.parse(raw || "[]") as GhIssue[]).map(toTask);
+    const issues = JSON.parse(raw || "[]") as GhIssue[];
+
+    // Sort here rather than asking GitHub to. The `--search "sort:updated-desc"` form is
+    // served from GitHub's search index, which lags behind writes by a few seconds — a
+    // freshly created issue can be missing from the result entirely, which is exactly
+    // the case the control room needs to be reliable about.
+    issues.sort((a, b) => timestampOf(b.updatedAt) - timestampOf(a.updatedAt));
+
+    const partial = issues.map(toTask);
 
     // Resolve dependencies inside the batch already in hand, so this stays one call.
     // A blocker outside the window counts as unresolved, which fails safe.
@@ -451,25 +483,38 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
   }
 
   async create(task: NewTask): Promise<Task> {
-    await this.ensureLabels();
-    const args = ["issue", "create", "--title", task.title, "--body-file", "-"];
-    for (const label of task.labels ?? []) args.push("--label", label);
-    const url = (await this.#gh(args, task.body)).trim();
+    const labels = task.labels ?? [];
+    await this.ensureLabels(labels);
+
+    const base = ["issue", "create", "--title", task.title, "--body-file", "-"];
+    const withLabels = [...base];
+    for (const label of labels) withLabels.push("--label", label);
+
+    let url: string;
+    let dropped: { labels: string; reason: string } | undefined;
+    try {
+      url = (await this.#gh(withLabels, task.body)).trim();
+    } catch (error) {
+      // Losing an issue because of a cosmetic label would be worse than losing the
+      // label, so retry bare and record what was dropped in the issue itself.
+      if (!(error instanceof GhError) || !/label/i.test(error.message)) throw error;
+      dropped = { labels: labels.join(", "), reason: error.message };
+      url = (await this.#gh(base, task.body)).trim();
+    }
 
     // gh prints the new issue's URL; the trailing path component is the number.
     const number = url.split("/").pop();
-    if (number && /^\d+$/.test(number)) {
-      const created = await this.get(number);
-      if (created) return created;
+    const id = number && /^\d+$/.test(number) ? number : url;
+
+    if (dropped && number && /^\d+$/.test(number)) {
+      await this
+        .comment(number, `Created by bagel without labels (${dropped.labels}).\n\n\`\`\`\n${dropped.reason}\n\`\`\``)
+        .catch(() => undefined);
     }
-    return {
-      id: number ?? url,
-      title: task.title,
-      body: task.body,
-      state: "open",
-      labels: task.labels ?? [],
-      url,
-    };
+
+    const created = await this.get(id).catch(() => null);
+    if (created) return created;
+    return { id, title: task.title, body: task.body, state: "open", labels: [], url };
   }
 
   /** Label changes for a state, as add/remove pairs. */
@@ -491,8 +536,8 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
   }
 
   async transition(id: TaskId, state: TaskState): Promise<Task> {
-    await this.ensureLabels();
     const { add, remove } = this.#labelDelta(state);
+    await this.ensureLabels(add);
     const args = ["issue", "edit", id];
     for (const label of add) args.push("--add-label", label);
     for (const label of remove) args.push("--remove-label", label);
@@ -532,7 +577,7 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
     await this.comment(id, renderClaimMarker(mine));
 
     // Ranking the comment's server-side timestamp first, then session id, makes the
-    // winner deterministic even when two markers share a second.
+    // winner deterministic even when two markers land in the same second.
     const live = (await this.claimsFor(id)).filter((claim) => !isExpired(claim));
     live.sort((a, b) => a.acquiredAt - b.acquiredAt || a.session.localeCompare(b.session));
     const winner = live[0];
@@ -542,7 +587,9 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
       return { ok: true, claim: mine };
     }
 
-    await this.#deleteOwnClaimComment(id, session).catch(() => undefined);
+    // Lost the race. Remove our marker so the record stays clean. Expired markers left
+    // by other sessions are ignored rather than collected; they do not affect anyone.
+    await this.#deleteOwnClaimComments(id, session);
     return { ok: false, claim: mine, holder: winner };
   }
 
@@ -556,9 +603,19 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
 
   /** Remove a session's claim markers from a task, returning it to ready if unclaimed. */
   async release(id: TaskId, session: string): Promise<void> {
-    await this.#deleteOwnClaimComment(id, session);
-    const remaining = (await this.claimsFor(id)).filter((claim) => !isExpired(claim));
-    if (!remaining.length) await this.transition(id, "open").catch(() => undefined);
+    const { failed } = await this.#deleteOwnClaimComments(id, session);
+    const stillHeld = (await this.claimsFor(id)).filter(
+      (claim) => claim.session !== session && !isExpired(claim),
+    );
+    if (!stillHeld.length) await this.transition(id, "open").catch(() => undefined);
+
+    if (failed > 0) {
+      // A marker we could not remove keeps the claim standing until its TTL passes, so
+      // do not pretend the release was clean.
+      throw new Error(
+        `could not remove ${failed} claim marker(s) on #${id}; it stays claimed until the TTL expires`,
+      );
+    }
   }
 
   /** Every live claim, in one call. Only claimed issues are fetched, so this is cheap. */
@@ -616,14 +673,44 @@ export class GitHubTracker implements TrackerAdapter, ClaimCapable {
     return out;
   }
 
-  async #deleteOwnClaimComment(id: TaskId, session: string): Promise<void> {
+  /**
+   * Delete a comment by its GraphQL node ID.
+   *
+   * `gh issue view --json comments` yields node IDs (`IC_kwDO…`), while the REST delete
+   * endpoint wants the numeric database ID — different ID spaces, so passing one to the
+   * other 404s. The GraphQL mutation accepts the node ID we already hold, which avoids
+   * an extra lookup per deletion.
+   */
+  async #deleteComment(nodeId: string): Promise<boolean> {
+    try {
+      await gh(
+        [
+          "api",
+          "graphql",
+          "-f",
+          "query=mutation($id: ID!) { deleteIssueComment(input: {id: $id}) { clientMutationId } }",
+          "-f",
+          `id=${nodeId}`,
+        ],
+        { timeoutMs: this.#timeoutMs },
+      );
+      return true;
+    } catch (error) {
+      // Already gone reaches the goal state just as well as deleting it.
+      return error instanceof GhError && /not found|could not resolve|does not exist/i.test(error.message);
+    }
+  }
+
+  /** Remove every claim marker this session owns on a task. */
+  async #deleteOwnClaimComments(id: TaskId, session: string): Promise<{ removed: number; failed: number }> {
+    let removed = 0;
+    let failed = 0;
     for (const claim of await this.claimsFor(id)) {
       if (claim.session !== session || !claim.ref) continue;
-      // Deleting a comment we authored is permitted, and keeps the thread clean.
-      await gh(["api", "-X", "DELETE", `repos/${this.slug}/issues/comments/${claim.ref}`], {
-        timeoutMs: this.#timeoutMs,
-      });
+      if (await this.#deleteComment(claim.ref)) removed += 1;
+      else failed += 1;
     }
+    return { removed, failed };
   }
 }
 

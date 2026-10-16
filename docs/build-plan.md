@@ -64,8 +64,11 @@ plane survives two sessions at once.
       `--seed` for a starter backlog
 
 **Verified:** `bun test` covers URL parsing, dependency parsing, the claim marker round
-trip, expiry, and contention. `bun run backlog --slug=cli/cli` reads a real repository:
-60 issues with correct derived state and labels.
+trip, expiry, contention, optimistic mutation, and stale-on-failure. `bun run backlog
+--slug=cli/cli` reads a real repository: 60 issues with correct derived state and
+labels. The claim protocol was also exercised against a live repository end to end:
+claim, contest, loser self-cleanup, heartbeat, release, and re-take — 12 checks, with
+the repository left exactly as found.
 
 **Still open:** nothing hands a claim to a worker yet, because workers do not exist yet.
 Claims are currently display-only.

@@ -170,6 +170,23 @@ marker, so an abandoned session cannot hold work forever. An `in-progress` issue
 no live marker displays as `claim expired or unrecorded` rather than silently looking
 healthy.
 
+Two sharp edges found by testing this against a real repository, both worth not
+rediscovering:
+
+- **Deletion needs a different ID than reading.** `gh issue view --json comments`
+  returns GraphQL node IDs (`IC_kwDO…`), while the REST delete endpoint expects the
+  numeric database ID (`6205370711`). They are distinct ID spaces and passing one where
+  the other is wanted 404s. Deletion therefore goes through the GraphQL
+  `deleteIssueComment` mutation, which accepts the node ID already in hand and costs no
+  extra lookup.
+- **Never sort with `--search`.** `gh issue list --search "sort:updated-desc"` is served
+  from GitHub's search index, which lags writes by seconds — a freshly created issue can
+  be absent from the result entirely. Listing sorts locally by `updatedAt`, which the
+  same call already returns.
+
+Reads must not depend on a write being indexed, and writes must not depend on a read
+being fresh, so mutations also apply to the cache optimistically before reconciling.
+
 ## 4. Domain model
 
 ```ts
