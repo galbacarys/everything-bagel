@@ -479,6 +479,76 @@ const ALL_TOOLS: ToolSpec[] = [
       return `Refused: ${view.reason ?? "work would be lost"}`;
     },
   },
+  {
+    name: "plan_read",
+    label: "Read a plan",
+    description:
+      "Read a plan you wrote and whether it has been approved. Approval is recorded against the plan itself, so this is the authoritative answer — not your memory of the conversation.",
+    parameters: Type.Object({ slug: Type.String({ description: "Plan slug." }) }),
+    verb: "plan.read",
+    render: (result) => {
+      const view = result as { slug: string; approved: boolean; taskId?: string; body: string };
+      return [
+        `# ${view.slug}${view.taskId ? ` (task #${view.taskId})` : ""}`,
+        view.approved ? "Status: APPROVED" : "Status: NOT APPROVED — dispatch will refuse this plan.",
+        "",
+        view.body,
+      ].join("\n");
+    },
+  },
+  {
+    name: "plan_list",
+    label: "List plans",
+    description: "List every plan and whether it has been approved.",
+    parameters: Type.Object({}),
+    verb: "plan.list",
+    render: (result) => {
+      const view = result as { plans: Array<{ slug: string; taskId?: string; approved: boolean }> };
+      if (!view.plans.length) return "No plans written yet.";
+      return view.plans
+        .map((plan) => `${plan.approved ? "approved  " : "pending   "}${plan.slug}${plan.taskId ? `  #${plan.taskId}` : ""}`)
+        .join("\n");
+    },
+  },
+  {
+    name: "dispatch_review",
+    label: "Review a finished run",
+    description:
+      "Dispatch an independent reviewer against a finished run's worktree. It sees the plan and the staged diff, and returns a verdict. Do this before landing anything: landing refuses without a PASS. After three rounds without a PASS, stop and ask a human.",
+    parameters: Type.Object({
+      runId: Type.String({ description: "The finished run to review." }),
+      planSlug: Type.Optional(Type.String({ description: "The plan it claims to implement, for the reviewer to check against." })),
+      focus: Type.Optional(Type.String({ description: "Anything specific the reviewer should pay attention to." })),
+    }),
+    verb: "dispatch.review",
+    render: (result) => {
+      const view = result as { runId: string; reviewsRun: string; round: number };
+      return [
+        `Started reviewer ${view.runId} on ${view.reviewsRun} (round ${view.round}).`,
+        "You will get a brief with its verdict; do not block on it.",
+      ].join("\n");
+    },
+  },
+  {
+    name: "dispatch_land",
+    label: "Push and open a pull request",
+    description:
+      "Commit the reviewed work, push its branch, and open a pull request. Refuses unless an independent reviewer returned VERDICT: PASS, so this is the last step of the loop, not a shortcut past it. The pull request is where the human reviews the change.",
+    parameters: Type.Object({
+      runId: Type.String({ description: "The run to land. Must have a PASS." }),
+      title: Type.String({ description: "Pull request title." }),
+      body: Type.Optional(Type.String({ description: "Pull request body, in Markdown." })),
+    }),
+    verb: "dispatch.land",
+    render: (result) => {
+      const view = result as { url: string; branch: string; base: string; committed: boolean };
+      return [
+        `Opened ${view.url}`,
+        `branch: ${view.branch} -> ${view.base}`,
+        view.committed ? "The change was committed." : "Nothing new to commit; the branch was already current.",
+      ].join("\n");
+    },
+  },
 ];
 
 /** Which verbs each role may use. A role that lacks a verb cannot call it at all. */
@@ -494,6 +564,8 @@ const ROLE_TOOLS: Record<Role, string[]> = {
     "notebook_append",
     "notebook_search",
     "plan_write",
+    "plan_read",
+    "plan_list",
     "gate_request",
     "dispatch_start",
     "dispatch_status",
@@ -501,6 +573,8 @@ const ROLE_TOOLS: Record<Role, string[]> = {
     "dispatch_steer",
     "dispatch_abort",
     "dispatch_drop",
+    "dispatch_review",
+    "dispatch_land",
   ],
   // Workers record what they learn but do not touch the coordination plane. The
   // supervisor owns the backlog so there is one place decisions are made.

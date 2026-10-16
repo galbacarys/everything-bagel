@@ -16,6 +16,7 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { resolveConfig } from "../src/config.ts";
 import { Bus } from "../src/domain/events.ts";
+import { Plans } from "../src/exec/plans.ts";
 import { Roster } from "../src/exec/roster.ts";
 import { ensureRoleFiles } from "../src/exec/roles.ts";
 import { Notebook } from "../src/notebook/store.ts";
@@ -52,6 +53,7 @@ bus.on((event) => {
 const roster = new Roster({
   bus,
   paths: config.paths,
+  plans: new Plans(config.paths.plans),
   session: config.session,
   models: config.models,
   extensionPath,

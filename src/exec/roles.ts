@@ -10,6 +10,10 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Role } from "../domain/types.ts";
+import { parseFrontmatter } from "../util/frontmatter.ts";
+
+// Re-exported so callers and tests have one import for role parsing.
+export { parseFrontmatter };
 
 export interface RoleDefinition {
   role: Role;
@@ -83,25 +87,6 @@ const DEFAULTS: Record<string, { frontmatter: string[]; body: string }> = {
   },
 };
 
-/** Parse `---` delimited frontmatter. Deliberately minimal: `key: value` only. */
-export function parseFrontmatter(text: string): { fields: Record<string, string>; body: string } {
-  const normalized = text.replace(/\r\n/g, "\n");
-  if (!normalized.startsWith("---\n")) return { fields: {}, body: normalized.trim() };
-
-  const end = normalized.indexOf("\n---", 3);
-  if (end === -1) return { fields: {}, body: normalized.trim() };
-
-  const fields: Record<string, string> = {};
-  for (const line of normalized.slice(4, end).split("\n")) {
-    const match = /^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/.exec(line.trim());
-    if (!match?.[1]) continue;
-    const value = (match[2] ?? "").trim().replace(/^["']|["']$/g, "");
-    if (value) fields[match[1]] = value;
-  }
-
-  const body = normalized.slice(end + 4).trim();
-  return { fields, body };
-}
 
 function fromFile(role: Role, path: string, text: string): RoleDefinition {
   const { fields, body } = parseFrontmatter(text);

@@ -31,6 +31,10 @@ export interface RunMeta {
   verdict?: "PASS" | "BLOCK";
   /** Where the full report landed, when there is one. */
   reportPath?: string;
+  /** Set on a reviewer: the run whose work it reviewed. */
+  reviewsRun?: string;
+  /** Set once the change has been pushed and a pull request opened. */
+  prUrl?: string;
 }
 
 export function runDir(runsDir: string, runId: string): string {

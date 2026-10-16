@@ -28,7 +28,7 @@ export interface ToolPolicy {
 }
 
 /** Verbs the supervisor gets, by prefix plus the two privileged singletons. */
-const SUPERVISOR_VERBS = "backlog_*,notebook_*,dispatch_*,plan_write,gate_request";
+const SUPERVISOR_VERBS = "backlog_*,notebook_*,dispatch_*,plan_*,gate_request";
 
 /**
  * The supervisor keeps `read` and nothing else built-in.

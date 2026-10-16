@@ -13,7 +13,6 @@
  * a directory that says what it was asked to do.
  */
 
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ModelChoice, ModelTier } from "../config.ts";
 import { tierFor } from "../config.ts";
@@ -22,17 +21,39 @@ import type { AgentRun, Brief, Role } from "../domain/types.ts";
 import { Agent } from "../pi/agent.ts";
 import { toolPolicyFor } from "../supervisor/policy.ts";
 import type { ProjectPaths } from "../util/paths.ts";
+import {
+  commitStaged,
+  openPullRequest,
+  PR_BODY_FILE,
+  pushBranch,
+  stageAll,
+  stagedDiff,
+  type Diff,
+} from "./gitops.ts";
+import type { Plans } from "./plans.ts";
 import { loadRole, type RoleDefinition } from "./roles.ts";
 import {
   extractFinalText,
+  listRunMetas,
   prepareRunDir,
+  readMeta,
   RunLog,
   writeMeta,
   writeReport,
   writeTask,
   type RunMeta,
 } from "./runstore.ts";
-import { branchFor, createWorktree, removeWorktree, type RemoveWorktreeResult } from "./worktree.ts";
+import {
+  branchFor,
+  createWorktree,
+  defaultBase,
+  gitRun,
+  removeWorktree,
+  type RemoveWorktreeResult,
+} from "./worktree.ts";
+
+/** A change gets at most this many review rounds before a human has to look at it. */
+export const MAX_REVIEW_ROUNDS = 3;
 
 export interface DispatchRequest {
   role: Role;
@@ -47,6 +68,8 @@ export interface DispatchRequest {
   base?: string;
   /** Continue in an existing worktree instead of creating one. */
   reuseWorktree?: string;
+  /** Set on a reviewer: the run whose work it is reviewing. */
+  reviewsRun?: string;
 }
 
 export interface RunRecord {
@@ -64,6 +87,8 @@ export interface RunRecord {
 export interface RosterOptions {
   bus: Bus;
   paths: ProjectPaths;
+  /** Plan store. Dispatch refuses a plan that has no recorded approval. */
+  plans: Plans;
   /** Identity of this bagel instance, recorded on every run. */
   session: string;
   /** Absolute path to the bagel extension, loaded into every worker. */
@@ -147,6 +172,7 @@ export function buildTaskPrompt(options: {
 export class Roster {
   readonly #bus: Bus;
   readonly #paths: ProjectPaths;
+  readonly #plans: Plans;
   readonly #session: string;
   readonly #extensionPath: string | undefined;
   readonly #piCli: string | undefined;
@@ -161,6 +187,7 @@ export class Roster {
   constructor(options: RosterOptions) {
     this.#bus = options.bus;
     this.#paths = options.paths;
+    this.#plans = options.plans;
     this.#session = options.session;
     this.#extensionPath = options.extensionPath;
     this.#piCli = options.piCli;
@@ -196,33 +223,36 @@ export class Roster {
     const runId = nextRunId(role);
     const dir = await prepareRunDir(this.#paths.runs, runId);
 
-    // Resolve the plan before anything is created, so a bad slug fails cheaply.
+    // Resolve the plan before anything is created, so a bad slug fails cheaply. An
+    // unapproved plan is refused right here, which is what makes "no code before
+    // approval" mechanical instead of a matter of the supervisor's memory.
     let planBody: string | undefined;
     let planPath: string | undefined;
     if (request.planSlug) {
-      planPath = join(this.#paths.plans, `${request.planSlug}.md`);
-      try {
-        planBody = await readFile(planPath, "utf8");
-      } catch {
-        throw new Error(`no plan at ${planPath}; write it with plan_write before dispatching`);
-      }
+      const plan = await this.#plans.requireApproved(request.planSlug);
+      planBody = plan.body;
+      planPath = plan.path;
     }
 
     const slug = request.slug ?? request.planSlug ?? request.taskId ?? role;
-    const branch = branchFor(role, this.#session, slug);
 
-    // A follow-up run continues in the worktree that already holds the earlier edits.
-    const worktreePath =
-      request.reuseWorktree ??
-      (
-        await createWorktree({
+    // A follow-up run continues in the worktree that already holds the earlier edits, so
+    // its branch is whatever that worktree is actually on rather than a new name.
+    const created = request.reuseWorktree
+      ? undefined
+      : await createWorktree({
           repoRoot: this.#paths.repoRoot,
           baseDir: this.#paths.worktrees,
           runId,
-          branch,
+          branch: branchFor(role, this.#session, slug),
           ...(request.base ? { base: request.base } : {}),
-        })
-      ).path;
+        });
+
+    const worktreePath = request.reuseWorktree ?? created?.path ?? "";
+    const branch = request.reuseWorktree
+      ? await branchOf(request.reuseWorktree)
+      : (created?.branch ?? "");
+    const base = request.base ?? created?.base ?? (await defaultBase(this.#paths.repoRoot));
 
     const taskPrompt = buildTaskPrompt({
       role,
@@ -264,7 +294,8 @@ export class Roster {
       ...(request.taskId ? { taskId: request.taskId } : {}),
       ...(model ? { model } : {}),
       ...(thinking ? { thinking } : {}),
-      ...(request.base ? { base: request.base } : {}),
+      base,
+      ...(request.reviewsRun ? { reviewsRun: request.reviewsRun } : {}),
     };
 
     const agent = new Agent({
@@ -326,6 +357,168 @@ export class Roster {
     }
 
     return record;
+  }
+
+  // -- review ---------------------------------------------------------------
+
+  /**
+   * Dispatch an independent reviewer against a finished run's worktree.
+   *
+   * Staging happens here rather than at commit time so the reviewer can see new files:
+   * `git diff` on the working tree omits untracked ones, and a brand-new file is exactly
+   * the kind of change most worth reviewing.
+   */
+  async review(runId: string, options: { planSlug?: string; focus?: string } = {}): Promise<RunRecord> {
+    const target = this.#require(runId);
+    if (!target.finished) throw new Error(`${runId} is still running; review it when it settles`);
+
+    const worktree = target.meta.worktree;
+    if (!worktree) throw new Error(`${runId} has no worktree to review`);
+
+    const base = target.meta.base ?? (await defaultBase(this.#paths.repoRoot));
+    await stageAll(worktree);
+
+    const diff = await stagedDiff(worktree, base, { saveTo: join(target.dir, "diff.patch") });
+    if (diff.filesChanged === 0) {
+      throw new Error(`${runId} changed nothing, so there is nothing to review`);
+    }
+
+    const rounds = await this.reviewRounds(runId);
+    if (rounds >= MAX_REVIEW_ROUNDS) {
+      throw new Error(
+        `${runId} has already had ${rounds} review rounds; stop looping and ask a human to look at it`,
+      );
+    }
+
+    const plan = options.planSlug ? await this.#plans.get(options.planSlug) : undefined;
+    const task = buildReviewTask({
+      targetRunId: runId,
+      base,
+      diff,
+      ...(plan?.body ? { planBody: plan.body } : {}),
+      ...(options.focus ? { focus: options.focus } : {}),
+    });
+
+    return await this.start({
+      role: "reviewer",
+      task,
+      reviewsRun: runId,
+      reuseWorktree: worktree,
+      base,
+      ...(target.meta.taskId ? { taskId: target.meta.taskId } : {}),
+      slug: `${target.meta.taskId ?? runId}-review`.slice(0, 40),
+    });
+  }
+
+  /**
+   * How many review rounds a run has had.
+   *
+   * Falls back to disk, so the cap survives a restart. Counting only in memory would let
+   * a restart reset the counter and a change be reviewed forever.
+   */
+  async reviewRounds(runId: string): Promise<number> {
+    const inMemory = this.records.filter((record) => record.meta.reviewsRun === runId).length;
+    if (inMemory > 0) return inMemory;
+    return (await listRunMetas(this.#paths.runs)).filter((meta) => meta.reviewsRun === runId).length;
+  }
+
+  /**
+   * The reviewer that returned PASS for a run, if one has.
+   *
+   * Checks disk after memory for the same reason: a reviewed change must not silently
+   * become an unreviewed one because bagel was restarted in between.
+   */
+  async passingReview(runId: string): Promise<RunMeta | undefined> {
+    const inMemory = this.records.find(
+      (record) => record.meta.reviewsRun === runId && record.meta.verdict === "PASS",
+    );
+    if (inMemory) return inMemory.meta;
+    return (await listRunMetas(this.#paths.runs)).find(
+      (meta) => meta.reviewsRun === runId && meta.verdict === "PASS",
+    );
+  }
+
+  /**
+   * A run's metadata, from memory or from disk.
+   *
+   * Landing is a filesystem operation over a run directory, not something that needs a
+   * live agent, so it works on a run this process never dispatched.
+   */
+  async metaFor(runId: string): Promise<RunMeta> {
+    const record = this.#records.get(runId);
+    if (record) {
+      if (!record.finished) throw new Error(`${runId} is still running; wait for it to settle`);
+      return record.meta;
+    }
+    const fromDisk = await readMeta(join(this.#paths.runs, runId));
+    if (!fromDisk) throw new Error(`unknown run: ${runId}`);
+    if (fromDisk.status === "running") throw new Error(`${runId} is still running; wait for it to settle`);
+    return fromDisk;
+  }
+
+  // -- landing --------------------------------------------------------------
+
+  /**
+   * Commit, push, and open a pull request.
+   *
+   * Refuses without an independent PASS. That check is the whole reason this lives in
+   * code rather than in the supervisor's instructions: an unreviewed change cannot reach
+   * a branch on the remote by asking nicely.
+   */
+  async land(
+    runId: string,
+    options: { title: string; body: string },
+  ): Promise<{ url: string; branch: string; base: string; committed: boolean; sha?: string }> {
+    const meta = await this.metaFor(runId);
+
+    const worktree = meta.worktree;
+    const branch = meta.branch;
+    if (!worktree || !branch) throw new Error(`${runId} has no worktree and branch to land`);
+
+    const approval = await this.passingReview(runId);
+    if (!approval) {
+      const rounds = await this.reviewRounds(runId);
+      const detail = rounds ? `${rounds} review round(s) without a PASS` : "it has never been reviewed";
+      throw new Error(`refusing to open a pull request for ${runId}: ${detail}`);
+    }
+
+    const base = meta.base ?? (await defaultBase(this.#paths.repoRoot));
+    await stageAll(worktree);
+
+    const commit = await commitStaged(
+      worktree,
+      `${options.title}\n\nTask: #${meta.taskId ?? "?"}\nReviewed-by: ${approval.id}`,
+    );
+    await pushBranch(worktree, branch);
+
+    const pr = await openPullRequest({
+      cwd: worktree,
+      title: options.title,
+      body: options.body,
+      // Into the run directory, not the worktree, which is about to be pushed.
+      bodyPath: join(this.#records.get(runId)?.dir ?? join(this.#paths.runs, runId), PR_BODY_FILE),
+      base,
+      head: branch,
+    });
+
+    // Record the pull request wherever this run's metadata lives. A run dispatched by an
+    // earlier process has no in-memory record, and losing the URL would be a shame.
+    const record = this.#records.get(runId);
+    if (record) {
+      record.meta = { ...record.meta, prUrl: pr.url };
+      await writeMeta(record.dir, record.meta);
+      await record.log.note(`pull request opened: ${pr.url}`);
+    } else {
+      await writeMeta(join(this.#paths.runs, runId), { ...meta, prUrl: pr.url });
+    }
+
+    return {
+      url: pr.url,
+      branch,
+      base,
+      committed: commit.committed,
+      ...(commit.sha ? { sha: commit.sha } : {}),
+    };
   }
 
   // -- control --------------------------------------------------------------
@@ -420,6 +613,63 @@ export class Roster {
 }
 
 /** Trim a run into something short enough to cross into the supervisor's context. */
+/** The prompt a reviewer receives: the claim, the plan, and the diff. */
+export function buildReviewTask(options: {
+  targetRunId: string;
+  base: string;
+  diff: Diff;
+  planBody?: string;
+  focus?: string;
+}): string {
+  const parts: string[] = [
+    `Review the change produced by run ${options.targetRunId}, in your working directory.`,
+    "",
+    "You did not write it, and you must not edit it. Read it and judge it.",
+    "",
+    `The diff below is against ${options.base}. It has ${options.diff.filesChanged} changed file(s), +${options.diff.additions}/-${options.diff.deletions}.`,
+  ];
+
+  if (options.diff.path) parts.push(`The complete patch is at ${options.diff.path}.`);
+  if (options.diff.truncated) parts.push("The diff below is truncated; read the file above for the rest.");
+  if (options.focus) parts.push("", `Pay particular attention to: ${options.focus}`);
+
+  if (options.planBody) {
+    parts.push("", "## The plan this claims to implement", "", options.planBody.trim());
+  }
+
+  parts.push(
+    "",
+    "## Diff",
+    "",
+    "```diff",
+    options.diff.patch.trim() || "(empty)",
+    "```",
+    "",
+    "## What to check",
+    "",
+    "- Does it do what the plan says, and only that? Every changed file must be justified.",
+    "- Check every state, not just the happy path. A path that can render a wrong, degraded,",
+    "  or misleading state is a blocker.",
+    "- Nits are not blockers. Do not block on style.",
+    "- Say when you cannot verify something instead of guessing.",
+    "",
+    "Begin your report with `VERDICT: PASS` or `VERDICT: BLOCK`, then the reasons.",
+  );
+
+  return parts.join("\n");
+}
+
+/**
+ * The branch a worktree is currently on.
+ *
+ * Read from git rather than derived, because a follow-up run reuses a worktree whose
+ * branch was named by whoever created it, and guessing that name is how you push to the
+ * wrong branch.
+ */
+async function branchOf(worktree: string): Promise<string> {
+  return (await gitRun(["rev-parse", "--abbrev-ref", "HEAD"], worktree)).trim();
+}
+
 export function summarize(run: AgentRun, report: string | undefined, max = 700): string {
   const headline = `${run.role} ${run.taskId ? `#${run.taskId} ` : ""}${run.status} in ${Math.round(
     ((run.endedAt ?? Date.now()) - run.startedAt) / 1000,

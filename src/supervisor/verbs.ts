@@ -7,23 +7,23 @@
  * before it reaches a handler.
  */
 
-import { writeFile, mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import type { Plans } from "../exec/plans.ts";
 import type { Roster } from "../exec/roster.ts";
 import type { BridgeHandlers } from "../ipc/bridge.ts";
 import type { Notebook } from "../notebook/store.ts";
 import type { Backlog } from "../tracker/backlog.ts";
 import { hasClaims, type ClaimCapable } from "../tracker/adapter.ts";
-import type { Role, TaskState } from "../domain/types.ts";
+import type { GateRequest, Role, TaskState } from "../domain/types.ts";
+import { toSlug } from "../util/frontmatter.ts";
 import type { GateQueue } from "./gates.ts";
 
 export interface VerbContext {
   backlog: Backlog;
   notebook: Notebook;
   roster: Roster;
+  /** Plans, and the grants that approving one records. */
+  plans: Plans;
   gates: GateQueue;
-  /** Directory plans are written to. */
-  plansPath: string;
   /** Identity of this bagel instance, recorded on claims and journal entries. */
   session: string;
   role: Role;
@@ -87,14 +87,12 @@ function requiredState(args: Record<string, unknown>, key: string): TaskState {
   return value as TaskState;
 }
 
-/** A slug becomes a filename, so it must not be able to escape the plans directory. */
-function safeSlug(raw: string): string {
-  const slug = raw
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (!slug) throw new ArgumentError("`slug` must contain at least one letter or digit");
+function requiredSlug(args: Record<string, unknown>, key: string): string {
+  const raw = requiredString(args, key);
+  // A slug becomes a filename and a branch name, so it must not be able to escape its
+  // directory or produce an illegal git ref.
+  const slug = toSlug(raw, "");
+  if (!slug) throw new ArgumentError(`\`${key}\` must contain at least one letter or digit`);
   return slug;
 }
 
@@ -226,46 +224,137 @@ export function buildHandlers(context: VerbContext): BridgeHandlers {
 
     "plan.write": async (raw) => {
       const args = asObject(raw);
-      const slug = safeSlug(requiredString(args, "slug"));
+      const slug = requiredSlug(args, "slug");
       const body = requiredString(args, "body");
       const taskId = optionalString(args, "taskId");
 
-      await mkdir(context.plansPath, { recursive: true });
-      const path = join(context.plansPath, `${slug}.md`);
-      const header = [
-        `# ${slug}`,
-        "",
-        taskId ? `Task: #${taskId}` : "Task: (unspecified)",
-        `Written: ${new Date().toISOString()}`,
-        "Status: awaiting approval — no code may be touched until a human approves.",
-        "",
-        "---",
-        "",
-      ].join("\n");
-      await writeFile(path, header + body + "\n", "utf8");
+      const plan = await context.plans.write(slug, taskId, body);
 
       await notebook.append({
         actor: context.role,
         kind: "work",
-        body: `Plan written: ${slug}`,
+        body: `Plan written: ${slug} (awaiting approval)`,
         tags: [...(taskId ? [taskId] : []), "plan"],
         ...(taskId ? { taskId } : {}),
       });
 
-      return { path, slug };
+      return { slug: plan.slug, path: plan.path, approved: false };
+    },
+
+    "plan.read": async (raw) => {
+      const args = asObject(raw);
+      const slug = requiredSlug(args, "slug");
+      const plan = await context.plans.get(slug);
+      if (!plan) throw new ArgumentError(`no plan named \`${slug}\``);
+      return {
+        slug: plan.slug,
+        taskId: plan.taskId,
+        body: plan.body,
+        path: plan.path,
+        approved: plan.approvedAt !== undefined,
+        approvedAt: plan.approvedAt,
+      };
+    },
+
+    "plan.list": async () => {
+      const plans = await context.plans.list();
+      return {
+        plans: plans.map((plan) => ({
+          slug: plan.slug,
+          taskId: plan.taskId,
+          approved: plan.approvedAt !== undefined,
+        })),
+      };
     },
 
     "gate.request": async (raw, bridgeContext) => {
       const args = asObject(raw);
-      return await gates.request(
+      const kind = (optionalString(args, "kind") ?? "plan") as GateRequest["kind"];
+      const ref = optionalString(args, "ref");
+
+      const decision = await gates.request(
         {
-          kind: (optionalString(args, "kind") ?? "plan") as never,
+          kind,
           prompt: requiredString(args, "prompt"),
           accept: optionalString(args, "accept") ?? "approve",
           ...(optionalString(args, "detail") ? { detail: optionalString(args, "detail")! } : {}),
+          ...(ref ? { ref } : {}),
         },
         bridgeContext.signal,
       );
+
+      // Approving a plan *is* the grant. Recording it here rather than trusting the
+      // supervisor means dispatch can refuse a plan a human never actually saw, however
+      // the supervisor chooses to describe the situation afterwards.
+      if (decision.accepted && kind === "plan" && ref) {
+        try {
+          const plan = await context.plans.approve(ref);
+          await notebook.append({
+            actor: "human",
+            kind: "decision",
+            body: `Plan \`${plan.slug}\` approved. Task-scoped grant issued.`,
+            tags: ["plan", "grant", ...(plan.taskId ? [plan.taskId] : [])],
+            ...(plan.taskId ? { taskId: plan.taskId } : {}),
+          });
+          return { ...decision, granted: plan.slug };
+        } catch (error) {
+          // Fail closed: an approval that could not be recorded is not an approval.
+          return {
+            accepted: false,
+            note: `a human approved, but the grant could not be recorded (${describe(error)}); do not proceed`,
+          };
+        }
+      }
+
+      return decision;
+    },
+
+    "dispatch.review": async (raw) => {
+      const args = asObject(raw);
+      const runId = requiredString(args, "runId");
+      const planSlug = optionalString(args, "planSlug");
+      const focus = optionalString(args, "focus");
+
+      const record = await context.roster.review(runId, {
+        ...(planSlug ? { planSlug } : {}),
+        ...(focus ? { focus } : {}),
+      });
+
+      const taskId = record.meta.taskId;
+      await notebook.append({
+        actor: context.role,
+        kind: "work",
+        body: `Reviewing ${runId} as ${record.meta.id}`,
+        tags: [...(taskId ? [taskId] : []), "review"],
+        ...(taskId ? { taskId } : {}),
+      });
+
+      return {
+        runId: record.meta.id,
+        reviewsRun: runId,
+        round: context.roster.records.filter((r) => r.meta.reviewsRun === runId).length,
+      };
+    },
+
+    "dispatch.land": async (raw) => {
+      const args = asObject(raw);
+      const runId = requiredString(args, "runId");
+      const result = await context.roster.land(runId, {
+        title: requiredString(args, "title"),
+        body: optionalString(args, "body") ?? "",
+      });
+
+      const record = context.roster.get(runId);
+      const taskId = record?.meta.taskId;
+      await notebook.append({
+        actor: context.role,
+        kind: "verdict",
+        body: `Opened ${result.url} from ${runId} on ${result.branch}`,
+        tags: [...(taskId ? [taskId] : []), "pr"],
+        ...(taskId ? { taskId } : {}),
+      });
+
+      return result;
     },
 
     // -- dispatch -----------------------------------------------------------
@@ -393,4 +482,8 @@ export function buildHandlers(context: VerbContext): BridgeHandlers {
       return result;
     },
   };
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -15,8 +15,10 @@ import { join } from "node:path";
 import { Container, ProcessTerminal, TuiMainScreen } from "@earendil-works/pi-tui";
 import { resolveConfig, tierFor } from "./config.ts";
 import { Bus } from "./domain/events.ts";
+import { Plans } from "./exec/plans.ts";
 import { ensureRoleFiles } from "./exec/roles.ts";
 import { Roster } from "./exec/roster.ts";
+import { baseDivergence } from "./exec/worktree.ts";
 import { BridgeServer } from "./ipc/bridge.ts";
 import { Notebook } from "./notebook/store.ts";
 import { Agent } from "./pi/agent.ts";
@@ -61,6 +63,7 @@ async function main(): Promise<void> {
 
   const bus = new Bus();
   const notebook = new Notebook(config.paths.journal, config.paths.docs);
+  const plans = new Plans(config.paths.plans);
   const gates = new GateQueue({ bus });
 
   const terminal = new ProcessTerminal();
@@ -156,6 +159,19 @@ async function main(): Promise<void> {
 
   bus.emit({ type: "notice", level: "info", message: `state ${config.paths.root}` });
 
+  // Workers branch from the *pushed* default branch, because that is what a pull request
+  // is opened against. When the local branch is ahead, a worker builds against older code
+  // and the pull request carries the difference for reasons nothing in it explains. Say so
+  // now rather than after a wasted run.
+  const divergence = await baseDivergence(config.repoRoot);
+  if (divergence) {
+    bus.emit({
+      type: "notice",
+      level: "warn",
+      message: `${divergence.local} is ${divergence.ahead} commit(s) ahead of ${divergence.remote} — push before dispatching, or workers will branch from stale code`,
+    });
+  }
+
   const probe = await probeGitHub(originUrl(config.repoRoot), { cwd: config.repoRoot });
   let adapter: TrackerAdapter;
   let degradedReason: string | undefined;
@@ -198,6 +214,7 @@ async function main(): Promise<void> {
   roster = new Roster({
     bus,
     paths: config.paths,
+    plans,
     session: config.session,
     models: config.models,
     ...(extensionPath ? { extensionPath } : {}),
@@ -269,8 +286,8 @@ async function main(): Promise<void> {
       backlog,
       notebook,
       roster,
+      plans,
       gates,
-      plansPath: config.paths.plans,
       session: config.session,
       role: "supervisor",
     }),
@@ -296,7 +313,7 @@ async function main(): Promise<void> {
     repoId: config.paths.id,
     trackerName: adapter.name,
     notebookPath: config.paths.notebook,
-    plansPath: config.paths.plans,
+    plansPath: plans.dir,
     verbs: bridge.verbs,
     ...(model.model ? { model: model.model } : {}),
   });

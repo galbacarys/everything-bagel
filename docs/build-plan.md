@@ -174,16 +174,65 @@ asked directly; the plan-approval gate that would trigger it is #3. The plumbing
 — `dispatch_start` takes a `planSlug` and embeds the plan file — but nothing has yet driven
 it from a real approval.
 
-## 5. Close the loop
+## 5. Close the loop — *done*
 
-- [ ] Plan artifact written and approved (the task-scoped grant)
-- [ ] Independent reviewer run, verdict read from the review artifact
-- [ ] Review loop capped at three rounds, then escalate
-- [ ] Notebook auto-writes from run lifecycle events
-- [ ] `recall()` primed into every new supervisor session
+**Risk retired:** that the constraints the design rests on are enforced by code rather
+then by the supervisor's willingness to follow instructions.
 
-**Done when:** the full path runs end to end — ask, claim, plan, approve, dispatch,
-review, record.
+- [x] `src/exec/plans.ts` — plans as markdown with frontmatter, where `approvedAt` *is* the
+      grant. Recorded against the plan file, so approval is a visible edit and nothing
+      trusts the supervisor's memory of a conversation.
+- [x] Dispatch refuses an unapproved plan. This is the mechanical form of "never implement
+      without permission", and it is the check that matters most in the whole system.
+- [x] `src/exec/gitops.ts` — stage, diff, commit, push, open a pull request.
+- [x] `Roster.review()` — an independent reviewer gets the plan and the **staged** diff.
+- [x] `Roster.land()` — refuses to open a pull request without `VERDICT: PASS` from a
+      reviewer that is not the implementer.
+- [x] Review rounds capped at three, counted from disk so a restart cannot reset the loop.
+- [x] Notebook entries written from run lifecycle events (dispatch, brief, verdict, PR).
+
+### What is enforced, and where
+
+| Rule | Enforced by |
+|---|---|
+| No code before a human approves the plan | `Plans.requireApproved`, called in `Roster.start` |
+| The supervisor cannot edit files or run commands | `--no-builtin-tools` on the supervisor session |
+| A change cannot be reviewed twice forever | `MAX_REVIEW_ROUNDS`, counted from `meta.json` |
+| An unreviewed change cannot reach the remote | `Roster.land` requires a passing review |
+| Removing a worktree cannot discard work | `removeWorktree` refuses a dirty or ahead tree |
+| A gate always settles | `GateQueue` timeout, abort, and shutdown paths |
+
+### Findings
+
+**`pr` is a `gh` subcommand, not a `git` one.** Obvious in hindsight, and the failure was
+confusing enough to be worth writing down: `git pr create` reports "git: 'pr' is not a git
+command" with a suggestion to use `prune`.
+
+**The reviewer must see the staged diff.** `git diff` on a working tree omits untracked
+files, so a brand-new file — exactly the kind of change most worth reviewing — would have
+been invisible. Staging happens before review, is reversible, and is what makes the diff
+complete.
+
+**The pull request body does not belong in the worktree.** It was being written to
+`pr-body.md` inside the tree that was about to be pushed, which would leave an unexplained
+file in the change. It goes in the run directory with the rest of the run's artifacts.
+
+**Branch from the remote default, and say when the local one has run ahead.** A pull request
+is opened against the remote's default branch, so branching from a local default that is
+ahead produces a pull request containing commits nobody asked the change to include. The
+base is now resolved to `origin/main` (or `origin/HEAD` when it is set), and startup warns
+when the local branch is ahead, because otherwise a worker builds against older code and
+the resulting diff is confusing for reasons nothing in it explains.
+
+**Verified:** `bun run loop` runs the whole path in one command against real child
+processes — `14/14` checks: the plan is written, dispatch refuses a plan nobody approved and
+creates nothing, the gate waits and records a grant on approval, the implementer runs
+outside the repository without touching the main checkout, the reviewer returns a verdict,
+and landing opens a pull request. 89 unit tests, up from 67, including the git operations
+against a real throwaway repository.
+
+**Left open for a human:** the pull request the loop produces. That is Gate 3 in the design,
+and it is not something to automate away.
 
 ## 6. Then
 

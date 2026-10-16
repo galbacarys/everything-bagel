@@ -137,4 +137,9 @@ export interface GateRequest {
   /** Affirmative label, e.g. "approve plan". */
   accept: string;
   detail?: string;
+  /**
+   * What is being approved, when that is a concrete thing with a name — a plan slug, for
+   * instance. Approving a `plan` gate with a `ref` records the grant against that plan.
+   */
+  ref?: string;
 }

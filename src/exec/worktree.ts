@@ -59,21 +59,59 @@ async function refExists(repoRoot: string, ref: string): Promise<boolean> {
 /**
  * Which ref a worktree should branch from.
  *
- * `origin/HEAD` is the honest answer when it exists, because it is the remote's notion
- * of the default branch. Falling back to `main` then `master` keeps a fresh clone with
- * no remote usable.
+ * Prefers the **remote-tracking** default branch, because a pull request is opened against
+ * the remote's default and branching from anything else produces a pull request containing
+ * commits nobody asked this change to include.
+ *
+ * `origin/HEAD` is the remote's own answer when it is set, which is common on a fresh
+ * clone and often missing after a fetch that pruned it, so the remote-tracking branches
+ * are tried by name too.
  */
 export async function defaultBase(repoRoot: string): Promise<string> {
   try {
     const ref = (await gitRun(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repoRoot)).trim();
     if (ref && (await refExists(repoRoot, ref))) return ref;
   } catch {
-    // No origin, or no remote HEAD set. Fall through.
+    // Not set. Fall through to the naming convention.
   }
+
+  for (const candidate of ["origin/main", "origin/master"]) {
+    if (await refExists(repoRoot, candidate)) return candidate;
+  }
+
+  // No usable remote, so a local branch is the best available answer.
   for (const candidate of ["main", "master"]) {
     if (await refExists(repoRoot, candidate)) return candidate;
   }
+
   return "HEAD";
+}
+
+/**
+ * How far the local default branch has run ahead of its remote counterpart.
+ *
+ * Worth surfacing rather than silently working around: when these differ, a worker
+ * branches from the pushed code while the developer is looking at the unpushed code, and
+ * the resulting pull request is confusing for reasons nothing in it explains.
+ */
+export async function baseDivergence(
+  repoRoot: string,
+): Promise<{ local: string; remote: string; ahead: number } | undefined> {
+  for (const [local, remote] of [
+    ["main", "origin/main"],
+    ["master", "origin/master"],
+  ] as const) {
+    if (!(await refExists(repoRoot, local)) || !(await refExists(repoRoot, remote))) continue;
+    try {
+      const count = (await gitRun(["rev-list", "--count", `${remote}..${local}`], repoRoot)).trim();
+      const ahead = Number.parseInt(count, 10) || 0;
+      if (ahead > 0) return { local, remote, ahead };
+    } catch {
+      // A failure here is not worth failing a dispatch over.
+    }
+    return undefined;
+  }
+  return undefined;
 }
 
 /** `feat/9c1de7b4-fix-token-refresh` */
