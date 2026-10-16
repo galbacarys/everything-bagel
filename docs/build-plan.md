@@ -45,16 +45,30 @@ step is meant to make unnecessary.
 **Done when:** the supervisor can list the backlog and append a journal entry through
 tools rather than by guessing, and an approval prompt appears as a bagel dialog.
 
-## 3. Real backlog
+## 3. Real backlog — *done*
 
-**Risk retired:** that the tracker is genuinely swappable.
+**Risk retired:** that the tracker is genuinely swappable, and that the coordination
+plane survives two sessions at once.
 
-- [ ] `GitHubTracker` behind the existing `TrackerAdapter` interface
-- [ ] Claim protocol: label plus comment marker, with a TTL heartbeat
-- [ ] Backlog pane gets real data, selection, and state transitions
+- [x] `GitHubTracker` behind the existing `TrackerAdapter` interface, driven through the
+      `gh` CLI so authentication stays entirely outside bagel
+- [x] `ClaimCapable` as a separate capability, with an optimistic claim that resolves by
+      read-back (see "The claim protocol" in the design)
+- [x] One API call per refresh: reads are batch operations, never N+1 per issue
+- [x] A cached `Backlog` that refreshes on a timer and keeps the last good snapshot when
+      a refresh fails, because a stale backlog beats a blank pane
+- [x] Dependency conventions (`blocked by #12`, `depends on #12`) resolved inside the
+      batch already in hand, so blocked state costs no extra call
+- [x] Graceful fallback to the in-memory adapter, with the reason shown in the header
+- [x] `bun run backlog` to inspect the tracker, with `--slug=` for any repository and
+      `--seed` for a starter backlog
 
-**Done when:** bagel lists real issues from a repo, and a claim is visible to another
-clone of the repository.
+**Verified:** `bun test` covers URL parsing, dependency parsing, the claim marker round
+trip, expiry, and contention. `bun run backlog --slug=cli/cli` reads a real repository:
+60 issues with correct derived state and labels.
+
+**Still open:** nothing hands a claim to a worker yet, because workers do not exist yet.
+Claims are currently display-only.
 
 ## 4. Dispatch and watch
 

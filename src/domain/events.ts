@@ -6,7 +6,7 @@
  * knows about the other, and neither side knows about pi.
  */
 
-import type { AgentRun, GateRequest, JournalEntry, Task } from "./types.ts";
+import type { AgentRun, Claim, GateRequest, JournalEntry, Task } from "./types.ts";
 
 export type DomainEvent =
   // Execution plane
@@ -17,7 +17,9 @@ export type DomainEvent =
   | { type: "run.settled"; run: AgentRun }
   | { type: "run.failed"; runId: string; error: string }
   // Coordination plane
-  | { type: "backlog.updated"; tasks: Task[] }
+  | { type: "backlog.updated"; tasks: Task[]; claims: Claim[] }
+  | { type: "backlog.unavailable"; reason: string }
+  | { type: "tracker.status"; trackerName: string; live: boolean; detail?: string }
   // Memory plane
   | { type: "notebook.appended"; entry: JournalEntry }
   // Gates

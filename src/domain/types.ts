@@ -38,6 +38,10 @@ export interface Claim {
   runId?: RunId;
   acquiredAt: number;
   ttlMs: number;
+  /** Adapter-specific handle for the claim record, e.g. a comment id. */
+  ref?: string;
+  /** Human handle of whoever holds it, when the tracker knows. */
+  holder?: string;
 }
 
 // ---------------------------------------------------------------------------

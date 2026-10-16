@@ -25,23 +25,35 @@ const app = new App({
   requestRender: () => {},
   repoId: "acme-widgets-4f2a19",
   session: "9c1de7b4",
-  trackerName: "GitHub Issues",
 });
 
 const now = Date.now();
 
 const tasks: Task[] = [
-  { id: "41", title: "token refresh fails on expiry", state: "open", labels: ["status:ready", "type:fix"] },
-  { id: "42", title: "billing proration off by a cent", state: "open", labels: ["status:ready"] },
+  {
+    id: "41",
+    title: "token refresh fails on expiry",
+    body: "Users are logged out early. Likely the cached token is not re-read.",
+    state: "open",
+    labels: ["status:ready", "type:fix"],
+  },
+  {
+    id: "42",
+    title: "billing proration off by a cent",
+    body: "Rounding disagrees with the invoice total.",
+    state: "open",
+    labels: ["status:ready"],
+  },
   {
     id: "43",
     title: "add /healthz endpoint",
+    body: "Required before the load balancer can be pointed at the service.",
     state: "blocked",
     labels: ["type:feat"],
     blockedBy: ["41"],
   },
-  { id: "39", title: "extract retry helper", state: "in-review", labels: [] },
-  { id: "38", title: "drop unused legacy shim", state: "done", labels: [] },
+  { id: "39", title: "extract retry helper", body: "Three call sites repeat the same loop.", state: "in-review", labels: [] },
+  { id: "38", title: "drop unused legacy shim", body: "Unreferenced since the v2 cutover.", state: "done", labels: [] },
 ];
 
 const runs: AgentRun[] = [
@@ -103,7 +115,21 @@ Shall I write the plan for #41?
 
 > Gate: plan approval will be requested before anything is claimed.`;
 
-bus.emit({ type: "backlog.updated", tasks });
+bus.emit({ type: "tracker.status", trackerName: "GitHub acme/widgets", live: true });
+bus.emit({
+  type: "backlog.updated",
+  tasks,
+  claims: [
+    {
+      taskId: "41",
+      session: "9c1de7b4",
+      runId: "implementer-1",
+      acquiredAt: now - 134_000,
+      ttlMs: 4 * 60 * 60 * 1000,
+      holder: "octocat",
+    },
+  ],
+});
 for (const run of runs) bus.emit({ type: "run.started", run });
 for (const entry of journal) bus.emit({ type: "notebook.appended", entry });
 bus.emit({ type: "notice", level: "info", message: "~/.bagel/projects/acme-widgets-4f2a19" });

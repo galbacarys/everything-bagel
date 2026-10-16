@@ -9,14 +9,11 @@ import { createRequire } from "node:module";
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { supervisorPrompt } from "./supervisor/prompt.ts";
 import { findRepoRoot, projectPaths, type ProjectPaths } from "./util/paths.ts";
 
 export interface SupervisorConfig {
   provider?: string;
   model?: string;
-  /** Appended to pi's system prompt. */
-  appendSystemPrompt: string;
   sessionName: string;
   sessionDir: string;
   extraArgs: string[];
@@ -131,17 +128,7 @@ export function resolveConfig(cwd: string = process.cwd()): ConfigResult {
   const paths = projectPaths(repoRoot);
   const provider = process.env["BAGEL_SUPERVISOR_PROVIDER"]?.trim() || undefined;
   const model = process.env["BAGEL_SUPERVISOR_MODEL"]?.trim() || undefined;
-
   const piCli = resolvePiCli() ?? resolvePiFromPath();
-
-  const appendSystemPrompt = supervisorPrompt({
-    repoRoot,
-    repoId: paths.id,
-    trackerName: "GitHub Issues (adapter pending; running in-memory)",
-    notebookPath: paths.notebook,
-    plansPath: paths.plans,
-    ...(model ? { supervisorModel: model } : {}),
-  });
 
   return {
     repoRoot,
@@ -152,7 +139,6 @@ export function resolveConfig(cwd: string = process.cwd()): ConfigResult {
     supervisor: {
       ...(provider ? { provider } : {}),
       ...(model ? { model } : {}),
-      appendSystemPrompt,
       sessionName: `bagel:${paths.id}`,
       sessionDir: join(paths.root, "sessions"),
       extraArgs: [],

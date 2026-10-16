@@ -144,6 +144,32 @@ src/
 `tracker/`. The only path from a pi event to a pixel is a domain event. This keeps
 the Go-shell port viable.
 
+### The claim protocol
+
+Claims are what make two sessions on the same repository safe, so the mechanism is
+worth stating precisely.
+
+A claim is a **marker comment** on the issue plus the `status:in-progress` label:
+
+```
+<!-- bagel:claim {"session":"9c1de7b4","runId":"implementer-1","at":1700000000000,"ttlMs":14400000} -->
+```
+
+The label makes claims visible to humans in the tracker's own UI. The comment carries
+the identity and the lease.
+
+GitHub has no atomic conditional write, so `claim()` is optimistic and resolves by
+**read-back**: post the marker, re-read every marker on the issue, and let the earliest
+surviving one win. A loser deletes its own comment, so the record stays clean rather
+than accumulating contested claims. Ordering uses the comment's server-side
+`createdAt` rather than the client clock, which may be skewed, and falls back to
+session id so the winner stays deterministic within the same second.
+
+Claims expire after a TTL (four hours by default) and are refreshed by re-stamping the
+marker, so an abandoned session cannot hold work forever. An `in-progress` issue with
+no live marker displays as `claim expired or unrecorded` rather than silently looking
+healthy.
+
 ## 4. Domain model
 
 ```ts

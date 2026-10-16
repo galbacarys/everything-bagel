@@ -23,18 +23,43 @@ The control-room shell runs. `bun start` opens four panes — backlog, superviso
 agents, notebook — in one process that owns the terminal, and drives a `pi --mode
 rpc` child whose output streams into the supervisor pane. There is no tmux.
 
-Design is settled; the remaining work is the supervisor's typed verbs, a real
-tracker adapter, and worker dispatch. See the build plan.
+The backlog is the repository's real GitHub Issues, read through `gh`, with claims,
+dependencies, and derived state.
+
+Design is settled; the remaining work is the supervisor's typed verbs, worker
+dispatch, and the plan-approval loop. See the build plan.
 
 ```sh
 bun install
 bun start              # the control room
+bun test               # parsers, claim protocol, expiry, contention
 bun run smoke          # headless check that the pi integration works
+bun run backlog        # inspect this repo's tracker from the terminal
 bun run preview 150 42 # render the UI to stdout at a fixed size
 ```
 
+`bun run backlog --seed` creates a starter backlog from the build plan, and
+`--slug=owner/name` reads any repository read-only.
+
 State lives outside the working tree, at `~/.bagel/projects/<repo-id>/` (or
 `$XDG_STATE_HOME/bagel`), keyed by repository identity.
+
+## The coordination plane
+
+The backlog is the repository's issue tracker, reached through the `gh` CLI, so
+bagel never holds a token. Issue labels carry bagel's state vocabulary
+(`status:ready`, `status:in-progress`, `status:in-review`, `status:blocked`), and
+dependencies are read from `blocked by #12` / `depends on #12` in the body.
+
+Concurrency is handled by **claims**: a claim is a marker comment plus a label, with
+a TTL. Because GitHub has no atomic conditional write, taking a claim posts the marker
+and then re-reads — the earliest surviving marker wins, and a loser deletes its own
+comment. See "The claim protocol" in the design.
+
+When the tracker is unreachable, bagel says why in the header and falls back to an
+in-memory backlog rather than showing a blank pane.
+
+## Docs
 
 - [`docs/design.md`](docs/design.md) — decisions, architecture, scope
 - [`docs/build-plan.md`](docs/build-plan.md) — ordered steps, each naming its risk

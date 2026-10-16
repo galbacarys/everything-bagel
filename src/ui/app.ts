@@ -32,7 +32,6 @@ export interface AppOptions {
   requestRender: () => void;
   repoId: string;
   session: string;
-  trackerName: string;
 }
 
 const PANE_ORDER: PaneId[] = ["backlog", "supervisor", "agents", "notebook"];
@@ -69,7 +68,8 @@ export class App implements Component {
       tasks: [],
       runs: [],
       journal: [],
-      trackerName: options.trackerName,
+      claims: new Map(),
+      trackerName: "connecting…",
       trackerLive: false,
       selectedTask: 0,
       focus: "prompt",
@@ -150,9 +150,25 @@ export class App implements Component {
 
       case "backlog.updated": {
         this.#state.tasks = event.tasks;
+        this.#state.claims = new Map(event.claims.map((claim) => [claim.taskId, claim]));
         this.#state.trackerLive = true;
+        this.#state.trackerDetail = undefined;
         const max = Math.max(0, event.tasks.length - 1);
         this.#state.selectedTask = Math.min(this.#state.selectedTask, max);
+        break;
+      }
+
+      case "backlog.unavailable": {
+        // Keep the last snapshot. A stale backlog is more useful than a blank pane.
+        this.#state.trackerLive = false;
+        this.#state.trackerDetail = event.reason;
+        break;
+      }
+
+      case "tracker.status": {
+        this.#state.trackerName = event.trackerName;
+        this.#state.trackerLive = event.live;
+        this.#state.trackerDetail = event.detail;
         break;
       }
 

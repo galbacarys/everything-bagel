@@ -5,7 +5,7 @@
 
 import { bold, dim, palette } from "./style.ts";
 import { spread, tail } from "./layout.ts";
-import type { AgentRun, JournalEntry, Task, TaskState } from "../domain/types.ts";
+import type { AgentRun, Claim, JournalEntry, Task, TaskId, TaskState } from "../domain/types.ts";
 
 export type PaneId = "backlog" | "supervisor" | "agents" | "notebook";
 
@@ -16,8 +16,12 @@ export interface PaneState {
   tasks: Task[];
   runs: AgentRun[];
   journal: JournalEntry[];
+  /** Live claims, keyed by task id. Empty when the tracker has no claim support. */
+  claims: ReadonlyMap<TaskId, Claim>;
   trackerName: string;
   trackerLive: boolean;
+  /** Why the tracker is unreachable, when it is. */
+  trackerDetail?: string;
   selectedTask: number;
   focus: FocusTarget;
   /** Set while the supervisor is mid-run, so the input line can say so. */
@@ -47,12 +51,13 @@ const STATE_COLOR: Record<TaskState, (text: string) => string> = {
 export function backlogContent(state: PaneState, height: number): string[] {
   const tasks = state.tasks;
   if (!tasks.length) {
-    return [
-      dim("No tasks."),
+    const lines = [
+      state.trackerLive ? dim("No open work.") : dim("No tasks (tracker unreachable)."),
       "",
-      dim("The tracker adapter is not wired up yet, so the backlog is empty."),
-      dim("Ask the supervisor to create work, or connect a tracker."),
     ];
+    if (!state.trackerLive && state.trackerDetail) lines.push(palette.warn(state.trackerDetail));
+    lines.push(dim("Ask the supervisor to create work, or file issues on the tracker."));
+    return lines;
   }
 
   const counts = new Map<TaskState, number>();
@@ -80,9 +85,14 @@ export function backlogContent(state: PaneState, height: number): string[] {
     const glyph = STATE_COLOR[task.state](STATE_GLYPH[task.state]);
     const title = task.state === "done" ? dim(task.title) : task.title;
     lines.push(`${pointer}${glyph} #${task.id} ${title}`);
-    if (task.blockedBy?.length) {
-      lines.push(`     ${dim(`blocked by ${task.blockedBy.map((b) => `#${b}`).join(", ")}`)}`);
-    }
+
+    const notes: string[] = [];
+    if (task.blockedBy?.length) notes.push(`blocked by ${task.blockedBy.map((b) => `#${b}`).join(", ")}`);
+    const claim = state.claims.get(task.id);
+    if (claim) notes.push(`held by ${claim.holder ?? claim.session}`);
+    else if (task.state === "claimed") notes.push("claim expired or unrecorded");
+    if (task.assignee) notes.push(`assigned ${task.assignee}`);
+    if (notes.length) lines.push(`     ${dim(notes.join("  ·  "))}`);
   }
 
   return tail(lines, height);
@@ -174,7 +184,11 @@ function truncateBody(text: string, max = 90): string {
 
 export function headerLine(state: PaneState, width: number, repoId: string, session: string): string {
   const left = `${bold(palette.accent("bagel"))} ${dim(repoId)} ${dim(`· ${session}`)}`;
-  const tracker = state.trackerLive ? palette.ok(state.trackerName) : palette.warn(`${state.trackerName} (offline)`);
+  // A detail means something is degraded — either the tracker is unreachable, or we
+  // fell back to a local one. Either way it should read as a warning, not a success.
+  const degraded = state.trackerDetail !== undefined;
+  const label = degraded ? `${state.trackerName} — ${state.trackerDetail}` : state.trackerName;
+  const tracker = state.trackerLive && !degraded ? palette.ok(label) : palette.warn(label);
   const workers = state.runs.filter((r) => r.role !== "supervisor" && r.status === "running").length;
   const right = workers > 0 ? `${tracker} ${dim("·")} ${palette.accent(`${workers} running`)}` : tracker;
   return spread(left, right, width);

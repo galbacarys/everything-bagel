@@ -12,8 +12,10 @@
     "start": "bun run src/main.ts",
     "dev": "bun --watch run src/main.ts",
     "typecheck": "tsc --noEmit",
+    "test": "bun test",
     "smoke": "bun run scripts/smoke.ts",
     "preview": "bun run scripts/render-preview.ts",
+    "backlog": "bun run scripts/backlog.ts",
     "build": "bun build --compile --outfile dist/bagel src/main.ts"
   },
   "dependencies": {
